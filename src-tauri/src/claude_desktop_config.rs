@@ -19,8 +19,14 @@ const CONFIG_FILE: &str = "claude_desktop_config.json";
 #[cfg(any(target_os = "macos", windows, test))]
 const CONFIG_LIBRARY_DIR: &str = "configLibrary";
 const GATEWAY_TOKEN_SETTING_KEY: &str = "claude_desktop_gateway_token";
-const AUTO_FALLBACK_BACKUP_SETTING_KEY: &str = "claude_desktop_cowork_auto_fallback_backup_v1";
-const AUTO_FALLBACK_PREFERENCE_KEY: &str = "coworkModelAutoFallbackByAccount";
+const LEGACY_AUTO_FALLBACK_BACKUP_SETTING_KEY: &str =
+    "claude_desktop_cowork_auto_fallback_backup_v1";
+const LEGACY_AUTO_FALLBACK_PREFERENCE_KEY: &str = "coworkModelAutoFallbackByAccount";
+const LOCAL_AGENT_SESSIONS_DIR: &str = "local-agent-mode-sessions";
+const LOCAL_AGENT_SETTINGS_FILE: &str = "settings.json";
+const LOCAL_AGENT_RETRY_BACKUP_FILE: &str = ".cc-switch-retry-backup.json";
+const CLAUDE_MAX_RETRIES_ENV: &str = "CLAUDE_CODE_MAX_RETRIES";
+const CLAUDE_RETRY_WATCHDOG_ENV: &str = "CLAUDE_CODE_RETRY_WATCHDOG";
 const CLAUDE_DESKTOP_PROXY_PREFIX: &str = "/claude-desktop";
 const DEFAULT_CREATED_AT: &str = "2024-01-01T00:00:00Z";
 const MIMO_REDACTED_THINKING_PLACEHOLDER: &str = "[redacted thinking]";
@@ -81,6 +87,7 @@ struct ClaudeDesktopPaths {
     config_library_path: PathBuf,
     profile_path: PathBuf,
     meta_path: PathBuf,
+    local_agent_sessions_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -953,18 +960,17 @@ fn apply_provider_to_paths(
     if is_official_provider(provider) {
         let result = restore_official_at_paths(db, paths);
         if result.is_ok() {
-            db.delete_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)?;
+            db.delete_setting(LEGACY_AUTO_FALLBACK_BACKUP_SETTING_KEY)?;
         }
         return result;
     }
 
     validate_provider(provider)?;
-    let mode = provider_mode(provider);
     let result = with_rollback(paths, |paths| {
         apply_provider_to_paths_inner(db, provider, paths)
     });
-    if result.is_ok() && matches!(mode, ClaudeDesktopMode::Direct) {
-        db.delete_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)?;
+    if result.is_ok() {
+        db.delete_setting(LEGACY_AUTO_FALLBACK_BACKUP_SETTING_KEY)?;
     }
     result
 }
@@ -997,9 +1003,10 @@ fn apply_provider_to_paths_inner(
     provider: &Provider,
     paths: &ClaudeDesktopPaths,
 ) -> Result<(), AppError> {
+    restore_legacy_cowork_auto_fallback(db, paths)?;
     let profile = match provider_mode(provider) {
         ClaudeDesktopMode::Direct => {
-            restore_cowork_auto_fallback(db, paths)?;
+            restore_local_agent_retry_settings(paths)?;
             let credentials = direct_gateway_credentials(provider)?;
             let model_specs = direct_inference_model_specs(provider)?;
             build_gateway_profile(
@@ -1009,7 +1016,10 @@ fn apply_provider_to_paths_inner(
             )
         }
         ClaudeDesktopMode::Proxy => {
-            backup_and_disable_cowork_auto_fallback(db, paths)?;
+            // Claude Desktop 的网络重试由本地 Claude Code agent 的环境变量控制。
+            // 在用户级 settings.json 中将它关闭后，429/5xx 的供应商轮询只由
+            // CC Switch 当前这一条入站请求完成，避免客户端再并发放大一轮请求。
+            apply_local_agent_retry_settings(paths)?;
             let base_url = proxy_gateway_base_url_from_db(db)?;
             let api_key = get_or_create_gateway_token(db)?;
             let routes = proxy_model_routes(provider)?;
@@ -1037,7 +1047,8 @@ fn restore_official_at_paths_inner(
     db: &Database,
     paths: &ClaudeDesktopPaths,
 ) -> Result<(), AppError> {
-    restore_cowork_auto_fallback(db, paths)?;
+    restore_legacy_cowork_auto_fallback(db, paths)?;
+    restore_local_agent_retry_settings(paths)?;
     write_deployment_mode(&paths.normal_config_path, "1p")?;
     write_deployment_mode(&paths.threep_config_path, "1p")?;
     remove_cc_switch_enterprise_config(&paths.threep_config_path)?;
@@ -1050,62 +1061,15 @@ fn restore_official_at_paths_inner(
     Ok(())
 }
 
-fn cowork_auto_fallback_value(path: &Path) -> Result<Option<Value>, AppError> {
-    let value = read_json_or_empty(path)?;
-    Ok(value
-        .get("preferences")
-        .and_then(Value::as_object)
-        .and_then(|preferences| preferences.get(AUTO_FALLBACK_PREFERENCE_KEY))
-        .cloned())
-}
-
-fn backup_and_disable_cowork_auto_fallback(
+fn restore_legacy_cowork_auto_fallback(
     db: &Database,
     paths: &ClaudeDesktopPaths,
 ) -> Result<(), AppError> {
-    if db.get_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)?.is_none() {
-        let backup = json!({
-            "normal": cowork_auto_fallback_value(&paths.normal_config_path)?,
-            "threep": cowork_auto_fallback_value(&paths.threep_config_path)?,
-        });
-        db.set_setting(
-            AUTO_FALLBACK_BACKUP_SETTING_KEY,
-            &serde_json::to_string(&backup).map_err(|error| AppError::Config(error.to_string()))?,
-        )?;
-    }
-
-    for path in [&paths.normal_config_path, &paths.threep_config_path] {
-        let mut root = read_json_or_empty(path)?;
-        let Some(root_object) = root.as_object_mut() else {
-            continue;
-        };
-        let preferences = root_object
-            .entry("preferences")
-            .or_insert_with(|| json!({}));
-        let Some(preferences) = preferences.as_object_mut() else {
-            continue;
-        };
-        let Some(by_account) = preferences
-            .get_mut(AUTO_FALLBACK_PREFERENCE_KEY)
-            .and_then(Value::as_object_mut)
-        else {
-            continue;
-        };
-        for enabled in by_account.values_mut() {
-            *enabled = Value::Bool(false);
-        }
-        write_json_file(path, &root)?;
-    }
-    Ok(())
-}
-
-fn restore_cowork_auto_fallback(db: &Database, paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
-    let Some(raw_backup) = db.get_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)? else {
+    let Some(raw_backup) = db.get_setting(LEGACY_AUTO_FALLBACK_BACKUP_SETTING_KEY)? else {
         return Ok(());
     };
     let backup: Value = serde_json::from_str(&raw_backup)
-        .map_err(|error| AppError::Config(format!("解析 Claude 自动回退备份失败: {error}")))?;
-
+        .map_err(|error| AppError::Config(format!("解析旧版 Claude 自动回退备份失败: {error}")))?;
     for (slot, path) in [
         ("normal", &paths.normal_config_path),
         ("threep", &paths.threep_config_path),
@@ -1120,16 +1084,145 @@ fn restore_cowork_auto_fallback(db: &Database, paths: &ClaudeDesktopPaths) -> Re
         let Some(preferences) = preferences.as_object_mut() else {
             continue;
         };
-
         match backup.get(slot) {
             Some(Value::Null) | None => {
-                preferences.remove(AUTO_FALLBACK_PREFERENCE_KEY);
+                preferences.remove(LEGACY_AUTO_FALLBACK_PREFERENCE_KEY);
             }
             Some(value) => {
-                preferences.insert(AUTO_FALLBACK_PREFERENCE_KEY.to_string(), value.clone());
+                preferences.insert(
+                    LEGACY_AUTO_FALLBACK_PREFERENCE_KEY.to_string(),
+                    value.clone(),
+                );
             }
         }
         write_json_file(path, &root)?;
+    }
+    Ok(())
+}
+
+fn local_agent_config_dirs(paths: &ClaudeDesktopPaths) -> Vec<PathBuf> {
+    let Ok(accounts) = fs::read_dir(&paths.local_agent_sessions_path) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for account in accounts.filter_map(Result::ok).map(|entry| entry.path()) {
+        if !account.is_dir()
+            || account.file_name().and_then(|name| name.to_str()) == Some("skills-plugin")
+        {
+            continue;
+        }
+        let Ok(profiles) = fs::read_dir(account) else {
+            continue;
+        };
+        for profile in profiles.filter_map(Result::ok).map(|entry| entry.path()) {
+            if profile.is_dir() && profile.join("cowork_account_settings.json").exists() {
+                dirs.push(profile);
+            }
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+fn backup_entry(env: &serde_json::Map<String, Value>, key: &str) -> Value {
+    match env.get(key) {
+        Some(value) => json!({ "present": true, "value": value }),
+        None => json!({ "present": false }),
+    }
+}
+
+fn restore_backup_entry(
+    env: &mut serde_json::Map<String, Value>,
+    key: &str,
+    backup: Option<&Value>,
+) {
+    if backup
+        .and_then(|entry| entry.get("present"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        if let Some(value) = backup.and_then(|entry| entry.get("value")) {
+            env.insert(key.to_string(), value.clone());
+            return;
+        }
+    }
+    env.remove(key);
+}
+
+fn apply_local_agent_retry_settings(paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
+    for dir in local_agent_config_dirs(paths) {
+        let settings_path = dir.join(LOCAL_AGENT_SETTINGS_FILE);
+        let backup_path = dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE);
+        let mut settings = read_json_or_empty(&settings_path)?;
+        let settings_object = settings.as_object_mut().ok_or_else(|| {
+            AppError::Config(format!(
+                "Claude local agent settings 不是 JSON 对象: {}",
+                settings_path.display()
+            ))
+        })?;
+        let env = settings_object.entry("env").or_insert_with(|| json!({}));
+        let env = env.as_object_mut().ok_or_else(|| {
+            AppError::Config(format!(
+                "Claude local agent settings.env 不是 JSON 对象: {}",
+                settings_path.display()
+            ))
+        })?;
+
+        if !backup_path.exists() {
+            let backup = json!({
+                "version": 1,
+                "settingsExisted": settings_path.exists(),
+                "maxRetries": backup_entry(env, CLAUDE_MAX_RETRIES_ENV),
+                "retryWatchdog": backup_entry(env, CLAUDE_RETRY_WATCHDOG_ENV),
+            });
+            write_json_file(&backup_path, &backup)?;
+        }
+
+        env.insert(CLAUDE_MAX_RETRIES_ENV.to_string(), json!("0"));
+        env.insert(CLAUDE_RETRY_WATCHDOG_ENV.to_string(), json!("false"));
+        write_json_file(&settings_path, &settings)?;
+    }
+    Ok(())
+}
+
+fn restore_local_agent_retry_settings(paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
+    for dir in local_agent_config_dirs(paths) {
+        let settings_path = dir.join(LOCAL_AGENT_SETTINGS_FILE);
+        let backup_path = dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE);
+        if !backup_path.exists() {
+            continue;
+        }
+        let backup: Value = read_json_file(&backup_path)?;
+        let mut settings = read_json_or_empty(&settings_path)?;
+        let settings_object = settings.as_object_mut().ok_or_else(|| {
+            AppError::Config(format!(
+                "Claude local agent settings 不是 JSON 对象: {}",
+                settings_path.display()
+            ))
+        })?;
+        let env_value = settings_object.entry("env").or_insert_with(|| json!({}));
+        let env = env_value.as_object_mut().ok_or_else(|| {
+            AppError::Config(format!(
+                "Claude local agent settings.env 不是 JSON 对象: {}",
+                settings_path.display()
+            ))
+        })?;
+        restore_backup_entry(env, CLAUDE_MAX_RETRIES_ENV, backup.get("maxRetries"));
+        restore_backup_entry(env, CLAUDE_RETRY_WATCHDOG_ENV, backup.get("retryWatchdog"));
+        if env.is_empty() {
+            settings_object.remove("env");
+        }
+
+        let originally_existed = backup
+            .get("settingsExisted")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !originally_existed && settings_object.is_empty() {
+            delete_file(&settings_path)?;
+        } else {
+            write_json_file(&settings_path, &settings)?;
+        }
+        delete_file(&backup_path)?;
     }
     Ok(())
 }
@@ -1171,25 +1264,30 @@ fn read_json_or_empty(path: &Path) -> Result<Value, AppError> {
 }
 
 fn snapshot_files(paths: &ClaudeDesktopPaths) -> Result<Vec<FileSnapshot>, AppError> {
-    [
+    let mut snapshot_paths = vec![
         &paths.normal_config_path,
         &paths.threep_config_path,
         &paths.profile_path,
         &paths.meta_path,
     ]
     .into_iter()
-    .map(|path| {
-        let content = if path.exists() {
-            Some(fs::read(path).map_err(|e| AppError::io(path, e))?)
-        } else {
-            None
-        };
-        Ok(FileSnapshot {
-            path: path.clone(),
-            content,
+    .cloned()
+    .collect::<Vec<_>>();
+    for dir in local_agent_config_dirs(paths) {
+        snapshot_paths.push(dir.join(LOCAL_AGENT_SETTINGS_FILE));
+        snapshot_paths.push(dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE));
+    }
+    snapshot_paths
+        .into_iter()
+        .map(|path| {
+            let content = if path.exists() {
+                Some(fs::read(&path).map_err(|e| AppError::io(&path, e))?)
+            } else {
+                None
+            };
+            Ok(FileSnapshot { path, content })
         })
-    })
-    .collect()
+        .collect()
 }
 
 fn restore_snapshots(snapshots: &[FileSnapshot]) -> Result<(), AppError> {
@@ -1404,6 +1502,7 @@ fn paths_from_dirs(normal_dir: PathBuf, threep_dir: PathBuf) -> ClaudeDesktopPat
         config_library_path,
         profile_path,
         meta_path,
+        local_agent_sessions_path: threep_dir.join(LOCAL_AGENT_SESSIONS_DIR),
     }
 }
 
@@ -1695,47 +1794,78 @@ mod tests {
     }
 
     #[test]
-    fn proxy_mode_takes_over_cowork_fallback_and_direct_mode_restores_it() {
+    fn proxy_mode_takes_over_cli_network_retries_and_direct_mode_restores_them() {
         let temp = TempDir::new().expect("tempdir");
         let paths = test_paths(temp.path());
         let db = test_db();
-        let original = json!({
+        let desktop_preferences = json!({
             "preferences": {
                 "coworkModelAutoFallbackByAccount": {
-                    "account-a": true
+                    "account-a": false
                 }
             }
         });
-        write_json_file(&paths.normal_config_path, &original).expect("write normal config");
-        write_json_file(&paths.threep_config_path, &original).expect("write 3p config");
+        write_json_file(&paths.normal_config_path, &desktop_preferences)
+            .expect("write normal config");
+        write_json_file(&paths.threep_config_path, &desktop_preferences).expect("write 3p config");
+        db.set_setting(
+            LEGACY_AUTO_FALLBACK_BACKUP_SETTING_KEY,
+            &json!({
+                "normal": {"account-a": true},
+                "threep": {"account-a": true}
+            })
+            .to_string(),
+        )
+        .expect("seed legacy fallback backup");
+        let agent_dir = paths
+            .local_agent_sessions_path
+            .join("account-a")
+            .join("00000000");
+        fs::create_dir_all(&agent_dir).expect("create agent config dir");
+        write_json_file(
+            &agent_dir.join("cowork_account_settings.json"),
+            &json!({"__created_at": "test"}),
+        )
+        .expect("write account marker");
+        write_json_file(
+            &agent_dir.join(LOCAL_AGENT_SETTINGS_FILE),
+            &json!({
+                "env": {
+                    CLAUDE_MAX_RETRIES_ENV: "7",
+                    "UNRELATED": "keep"
+                }
+            }),
+        )
+        .expect("write original settings");
 
         apply_provider_to_paths(&db, &proxy_provider("proxy"), &paths)
             .expect("apply proxy provider");
         for path in [&paths.normal_config_path, &paths.threep_config_path] {
-            let value: Value = read_json_file(path).expect("read disabled fallback config");
-            assert_eq!(
-                value["preferences"]["coworkModelAutoFallbackByAccount"]["account-a"],
-                json!(false)
-            );
-        }
-        assert!(db
-            .get_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)
-            .expect("read fallback backup")
-            .is_some());
-
-        apply_provider_to_paths(&db, &direct_provider("direct"), &paths)
-            .expect("apply direct provider");
-        for path in [&paths.normal_config_path, &paths.threep_config_path] {
-            let value: Value = read_json_file(path).expect("read restored fallback config");
+            let value: Value = read_json_file(path).expect("read untouched desktop preferences");
             assert_eq!(
                 value["preferences"]["coworkModelAutoFallbackByAccount"]["account-a"],
                 json!(true)
             );
         }
+        let managed: Value = read_json_file(&agent_dir.join(LOCAL_AGENT_SETTINGS_FILE))
+            .expect("read managed settings");
+        assert_eq!(managed["env"][CLAUDE_MAX_RETRIES_ENV], json!("0"));
+        assert_eq!(managed["env"][CLAUDE_RETRY_WATCHDOG_ENV], json!("false"));
+        assert_eq!(managed["env"]["UNRELATED"], json!("keep"));
+        assert!(agent_dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE).exists());
         assert!(db
-            .get_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)
-            .expect("read cleared fallback backup")
+            .get_setting(LEGACY_AUTO_FALLBACK_BACKUP_SETTING_KEY)
+            .expect("read legacy backup")
             .is_none());
+
+        apply_provider_to_paths(&db, &direct_provider("direct"), &paths)
+            .expect("apply direct provider");
+        let restored: Value = read_json_file(&agent_dir.join(LOCAL_AGENT_SETTINGS_FILE))
+            .expect("read restored settings");
+        assert_eq!(restored["env"][CLAUDE_MAX_RETRIES_ENV], json!("7"));
+        assert!(restored["env"].get(CLAUDE_RETRY_WATCHDOG_ENV).is_none());
+        assert_eq!(restored["env"]["UNRELATED"], json!("keep"));
+        assert!(!agent_dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE).exists());
     }
 
     #[test]

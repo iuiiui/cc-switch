@@ -110,6 +110,27 @@ pub struct SwitchResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalSwitchOutcome {
+    Applied,
+    AlreadyCurrent,
+    Stale,
+}
+
+fn conditional_switch_outcome(
+    actual: Option<&str>,
+    expected: Option<&str>,
+    target: &str,
+) -> ConditionalSwitchOutcome {
+    if actual == Some(target) {
+        ConditionalSwitchOutcome::AlreadyCurrent
+    } else if actual != expected {
+        ConditionalSwitchOutcome::Stale
+    } else {
+        ConditionalSwitchOutcome::Applied
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +153,22 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
+
+    #[test]
+    fn conditional_switch_accepts_only_one_target_from_the_same_expected_current() {
+        assert_eq!(
+            conditional_switch_outcome(Some("p0"), Some("p0"), "p1"),
+            ConditionalSwitchOutcome::Applied
+        );
+        assert_eq!(
+            conditional_switch_outcome(Some("p1"), Some("p0"), "p2"),
+            ConditionalSwitchOutcome::Stale
+        );
+        assert_eq!(
+            conditional_switch_outcome(Some("p1"), Some("p0"), "p1"),
+            ConditionalSwitchOutcome::AlreadyCurrent
+        );
+    }
 
     struct TempHome {
         #[allow(dead_code)]
@@ -5100,21 +5137,24 @@ impl ProviderService {
             return Self::switch_normal(state, app_type, id, &providers);
         }
 
-        if matches!(app_type, AppType::ClaudeDesktop) {
-            return Self::switch_normal(state, app_type, id, &providers);
-        }
-
         // Provider switches and takeover toggles both mutate live config and the
         // restore backup. Serialize them per app, then decide from the locked
         // current state so a just-started takeover cannot be overwritten by a
         // normal live write.
-        let _switch_guard = if app_type.supports_local_proxy() {
-            Some(futures::executor::block_on(
-                state.proxy_service.lock_switch_for_app(app_type.as_str()),
-            ))
-        } else {
-            None
-        };
+        let _switch_guard =
+            if app_type.supports_local_proxy() || matches!(app_type, AppType::ClaudeDesktop) {
+                Some(futures::executor::block_on(
+                    state.proxy_service.lock_switch_for_app(app_type.as_str()),
+                ))
+            } else {
+                None
+            };
+
+        // Claude Desktop 的 profile、current 和本地 agent settings 必须作为同一
+        // 个串行提交写入；它不使用传统 Live takeover，锁内直接走 normal switch。
+        if matches!(app_type, AppType::ClaudeDesktop) {
+            return Self::switch_normal(state, app_type, id, &providers);
+        }
 
         // Backup or live placeholders mean the live file is owned by proxy
         // takeover, even if the proxy server is temporarily stopped or is in the
@@ -5167,6 +5207,41 @@ impl ProviderService {
 
         // Normal mode: full switch with Live config write
         Self::switch_normal(state, app_type, id, &providers)
+    }
+
+    /// 仅当当前供应商仍等于请求开始时的供应商时提交 Claude Desktop 故障转移。
+    ///
+    /// 同一批并发请求会携带相同 expected。第一项切换成功后，迟到结果会在共享
+    /// app 锁内被判为 Stale，因而不会再次重写 profile 或把供应商切到另一家。
+    pub fn switch_claude_desktop_if_current(
+        state: &AppState,
+        expected_current: Option<&str>,
+        id: &str,
+    ) -> Result<ConditionalSwitchOutcome, AppError> {
+        let app_type = AppType::ClaudeDesktop;
+        let providers = state.db.get_all_providers(app_type.as_str())?;
+        providers
+            .get(id)
+            .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
+
+        let _switch_guard =
+            futures::executor::block_on(state.proxy_service.lock_switch_for_app(app_type.as_str()));
+        let actual = crate::settings::get_effective_current_provider(&state.db, &app_type)?;
+        match conditional_switch_outcome(actual.as_deref(), expected_current, id) {
+            ConditionalSwitchOutcome::AlreadyCurrent => {
+                return Ok(ConditionalSwitchOutcome::AlreadyCurrent);
+            }
+            ConditionalSwitchOutcome::Stale => {
+                log::debug!(
+                    "[Failover] Claude Desktop stale switch skipped: expected={expected_current:?}, actual={actual:?}, target={id}"
+                );
+                return Ok(ConditionalSwitchOutcome::Stale);
+            }
+            ConditionalSwitchOutcome::Applied => {}
+        }
+
+        Self::switch_normal(state, app_type, id, &providers)?;
+        Ok(ConditionalSwitchOutcome::Applied)
     }
 
     /// Normal switch flow (non-proxy mode)

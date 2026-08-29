@@ -145,6 +145,34 @@ fn build_message_delta_event(stop_reason: Option<String>, usage_json: Option<Val
     })
 }
 
+fn openai_error_to_anthropic(value: Option<&Value>, named_event: Option<&str>) -> Option<Value> {
+    let is_error = named_event == Some("error")
+        || value
+            .and_then(|root| root.get("error"))
+            .is_some_and(|error| !error.is_null())
+        || value
+            .and_then(|root| root.get("type"))
+            .and_then(Value::as_str)
+            == Some("error");
+    if !is_error {
+        return None;
+    }
+    let error = value.and_then(|root| root.get("error"));
+    let error_type = error
+        .and_then(|error| error.get("type").or_else(|| error.get("code")))
+        .and_then(Value::as_str)
+        .unwrap_or("upstream_error");
+    let message = error
+        .and_then(|error| error.get("message").or_else(|| error.get("detail")))
+        .and_then(Value::as_str)
+        .or_else(|| error.and_then(Value::as_str))
+        .unwrap_or("Upstream returned an error event");
+    Some(json!({
+        "type": "error",
+        "error": { "type": error_type, "message": message }
+    }))
+}
+
 /// 创建 Anthropic SSE 流
 pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -171,9 +199,14 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         let mut tool_blocks_by_index: HashMap<usize, ToolBlockState> = HashMap::new();
         let mut open_tool_block_indices: HashSet<u32> = HashSet::new();
 
+        // 补一个输入侧 EOF 分隔符，使最后一个没有尾随空行的完整 SSE 事件
+        // 仍能被 take_sse_block 解析。正常以空行结束时它只是一个空块。
+        let stream = stream.chain(futures::stream::once(async {
+            Ok::<Bytes, E>(Bytes::from_static(b"\n\n"))
+        }));
         tokio::pin!(stream);
 
-        while let Some(chunk) = stream.next().await {
+        'upstream: while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
@@ -183,30 +216,57 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                             continue;
                         }
 
+                        let named_event = line
+                            .lines()
+                            .find_map(|line| strip_sse_field(line, "event"))
+                            .map(str::trim);
                         for l in line.lines() {
                             if let Some(data) = strip_sse_field(l, "data") {
                                 if data.trim() == "[DONE]" {
                                     log::debug!("[Claude/OpenRouter] <<< OpenAI SSE: [DONE]");
 
-                                    // 流正常结束，发出缓存的 message_delta（含完整 usage）。
+                                    // 只有已经看到 finish_reason 才能成功终止；裸 [DONE]
+                                    // 不能被伪装成 end_turn。
                                     if let Some((stop_reason, usage_json)) = pending_message_delta.take() {
                                         let event = build_message_delta_event(stop_reason, usage_json);
                                         let sse_data = format!("event: message_delta\ndata: {}\n\n",
                                             serde_json::to_string(&event).unwrap_or_default());
                                         log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_delta (from pending)");
                                         yield Ok(Bytes::from(sse_data));
+                                        let event = json!({"type": "message_stop"});
+                                        let sse_data = format!("event: message_stop\ndata: {}\n\n",
+                                            serde_json::to_string(&event).unwrap_or_default());
+                                        log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_stop");
+                                        yield Ok(Bytes::from(sse_data));
+                                        has_sent_message_stop = true;
+                                    } else {
+                                        let error = json!({
+                                            "type": "error",
+                                            "error": {
+                                                "type": "stream_truncated",
+                                                "message": "OpenAI Chat stream ended with [DONE] before finish_reason"
+                                            }
+                                        });
+                                        yield Ok(Bytes::from(format!(
+                                            "event: error\ndata: {}\n\n",
+                                            serde_json::to_string(&error).unwrap_or_default()
+                                        )));
+                                        stream_ended_with_error = true;
                                     }
-
-                                    let event = json!({"type": "message_stop"});
-                                    let sse_data = format!("event: message_stop\ndata: {}\n\n",
-                                        serde_json::to_string(&event).unwrap_or_default());
-                                    log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_stop");
-                                    yield Ok(Bytes::from(sse_data));
-                                    has_sent_message_stop = true;
-                                    continue;
+                                    break 'upstream;
                                 }
 
-                                if let Ok(chunk) = serde_json::from_str::<OpenAIStreamChunk>(data) {
+                                let raw_value = serde_json::from_str::<Value>(data).ok();
+                                if let Some(error) = openai_error_to_anthropic(raw_value.as_ref(), named_event) {
+                                    yield Ok(Bytes::from(format!(
+                                        "event: error\ndata: {}\n\n",
+                                        serde_json::to_string(&error).unwrap_or_default()
+                                    )));
+                                    stream_ended_with_error = true;
+                                    break 'upstream;
+                                }
+
+                                if let Some(Ok(chunk)) = raw_value.map(serde_json::from_value::<OpenAIStreamChunk>) {
                                     log::debug!("[Claude/OpenRouter] <<< SSE chunk received");
 
                                     if message_id.is_none() && !chunk.id.is_empty() {
@@ -644,7 +704,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
             }
         }
 
-        // 流自然结束但未收到 [DONE] 时，确保发送缓存的 message_delta 和 message_stop。
+        // 流自然结束但未收到 [DONE] 时，仅在 finish_reason 已到达时补成功终止。
         // 若上游已显式报错，则只保留 error 事件，避免把失败伪装成成功完成。
         if !stream_ended_with_error {
             let emitted_pending_message_delta = if let Some((stop_reason, usage_json)) =
@@ -666,6 +726,18 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                     serde_json::to_string(&event).unwrap_or_default());
                 log::debug!("[Claude/OpenRouter] >>> Anthropic SSE: message_stop (at stream end)");
                 yield Ok(Bytes::from(sse_data));
+            } else if !emitted_pending_message_delta && !has_sent_message_stop {
+                let error = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "stream_truncated",
+                        "message": "OpenAI Chat stream ended before finish_reason"
+                    }
+                });
+                yield Ok(Bytes::from(format!(
+                    "event: error\ndata: {}\n\n",
+                    serde_json::to_string(&error).unwrap_or_default()
+                )));
             }
         }
     }
@@ -1210,6 +1282,52 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event_type(event) == Some("message_stop")));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event_type(event) == Some("error"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event_type(event) == Some("error"))
+                .and_then(|event| event.pointer("/error/type"))
+                .and_then(Value::as_str),
+            Some("stream_truncated")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_envelope_becomes_anthropic_error() {
+        let input =
+            "event: error\ndata: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n";
+        let events = collect_anthropic_events(input).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(event_type(&events[0]), Some("error"));
+        assert_eq!(
+            events[0].pointer("/error/type").and_then(Value::as_str),
+            Some("server_error")
+        );
+        assert_eq!(
+            events[0].pointer("/error/message").and_then(Value::as_str),
+            Some("boom")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finish_reason_without_trailing_blank_line_is_processed() {
+        let input = concat!(
+            "data: {\"id\":\"chatcmpl_tail\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_tail\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}"
+        );
+        let events = collect_anthropic_events(input).await;
+        assert!(events.iter().any(|event| {
+            event_type(event) == Some("message_delta")
+                && event.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("end_turn")
+        }));
+        assert_eq!(events.last().and_then(event_type), Some("message_stop"));
     }
 
     #[tokio::test]

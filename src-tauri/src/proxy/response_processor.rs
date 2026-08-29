@@ -20,6 +20,7 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -197,6 +198,11 @@ pub async fn handle_streaming(
         usage_collector,
         timeout_config,
         connection_guard,
+        if matches!(ctx.app_type_str, "claude" | "claude-desktop") {
+            SseTerminalPolicy::AnthropicMessages
+        } else {
+            SseTerminalPolicy::Passthrough
+        },
     );
 
     let body = axum::body::Body::from_stream(logged_stream);
@@ -680,12 +686,101 @@ async fn log_usage_internal(
 }
 
 /// 创建带日志记录和超时控制的透传流
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseTerminalPolicy {
+    Passthrough,
+    AnthropicMessages,
+}
+
+#[derive(Default)]
+struct AnthropicTerminalState {
+    saw_message_start: bool,
+    saw_final_message_delta: bool,
+    saw_message_stop: bool,
+    saw_error: bool,
+    open_content_blocks: HashSet<u64>,
+}
+
+fn observe_anthropic_sse_block(block: &str, state: &mut AnthropicTerminalState) {
+    let named_event = block
+        .lines()
+        .find_map(|line| strip_sse_field(line, "event"))
+        .map(str::trim);
+    let data = block
+        .lines()
+        .filter_map(|line| strip_sse_field(line, "data"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parsed = serde_json::from_str::<Value>(&data).ok();
+    let event_type = parsed
+        .as_ref()
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .or(named_event);
+
+    match event_type {
+        Some("message_start") => state.saw_message_start = true,
+        Some("content_block_start") => {
+            if let Some(index) = parsed
+                .as_ref()
+                .and_then(|value| value.get("index"))
+                .and_then(Value::as_u64)
+            {
+                state.open_content_blocks.insert(index);
+            }
+        }
+        Some("content_block_stop") => {
+            if let Some(index) = parsed
+                .as_ref()
+                .and_then(|value| value.get("index"))
+                .and_then(Value::as_u64)
+            {
+                state.open_content_blocks.remove(&index);
+            }
+        }
+        Some("message_delta") => {
+            state.saw_final_message_delta = parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/delta/stop_reason"))
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.is_empty());
+        }
+        Some("message_stop") => state.saw_message_stop = true,
+        Some("error") => state.saw_error = true,
+        _ => {}
+    }
+}
+
+fn anthropic_terminal_bytes(
+    state: &AnthropicTerminalState,
+    error_type: &str,
+    message: &str,
+) -> Option<Bytes> {
+    if state.saw_message_stop || state.saw_error {
+        return None;
+    }
+    if state.saw_message_start
+        && state.saw_final_message_delta
+        && state.open_content_blocks.is_empty()
+    {
+        return Some(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ));
+    }
+    let payload = serde_json::json!({
+        "type": "error",
+        "error": { "type": error_type, "message": message }
+    });
+    Some(Bytes::from(format!("event: error\ndata: {}\n\n", payload)))
+}
+
 pub fn create_logged_passthrough_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     tag: &'static str,
     usage_collector: Option<SseUsageCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
+    terminal_policy: SseTerminalPolicy,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
@@ -694,7 +789,10 @@ pub fn create_logged_passthrough_stream(
         let mut collector = usage_collector;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events =
-            collector.is_some() || log::log_enabled!(log::Level::Debug);
+            collector.is_some()
+                || log::log_enabled!(log::Level::Debug)
+                || terminal_policy == SseTerminalPolicy::AnthropicMessages;
+        let mut anthropic_state = AnthropicTerminalState::default();
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -728,7 +826,22 @@ pub fn create_logged_passthrough_stream(
                             // 超时
                             let timeout_type = if is_first_chunk { "首字节" } else { "静默期" };
                             log::error!("[{tag}] 流式响应{}超时 ({}秒)", timeout_type, duration.as_secs());
-                            yield Err(std::io::Error::other(format!("流式响应{timeout_type}超时")));
+                            if terminal_policy == SseTerminalPolicy::AnthropicMessages {
+                                if !buffer.trim().is_empty() {
+                                    observe_anthropic_sse_block(&buffer, &mut anthropic_state);
+                                    buffer.clear();
+                                    yield Ok(Bytes::from_static(b"\n\n"));
+                                }
+                                if let Some(terminal) = anthropic_terminal_bytes(
+                                    &anthropic_state,
+                                    "stream_timeout",
+                                    &format!("Upstream stream was idle for {} seconds", duration.as_secs()),
+                                ) {
+                                    yield Ok(terminal);
+                                }
+                            } else {
+                                yield Err(std::io::Error::other(format!("流式响应{timeout_type}超时")));
+                            }
                             break;
                         }
                     }
@@ -751,6 +864,9 @@ pub fn create_logged_passthrough_stream(
                         // 尝试解析并记录完整的 SSE 事件
                         while let Some(event_text) = take_sse_block(&mut buffer) {
                             if !event_text.trim().is_empty() {
+                                if terminal_policy == SseTerminalPolicy::AnthropicMessages {
+                                    observe_anthropic_sse_block(&event_text, &mut anthropic_state);
+                                }
                                 // 提取 data 部分；只有 usage collector 存在时才解析 JSON。
                                 for line in event_text.lines() {
                                     if let Some(data) = strip_sse_field(line, "data") {
@@ -781,14 +897,47 @@ pub fn create_logged_passthrough_stream(
                     }
 
                     yield Ok(bytes);
+                    if terminal_policy == SseTerminalPolicy::AnthropicMessages
+                        && (anthropic_state.saw_message_stop || anthropic_state.saw_error)
+                    {
+                        break;
+                    }
                 }
                 Some(Err(e)) => {
                     log::error!("[{tag}] 流错误: {e}");
-                    yield Err(std::io::Error::other(e.to_string()));
+                    if terminal_policy == SseTerminalPolicy::AnthropicMessages {
+                        if !buffer.trim().is_empty() {
+                            observe_anthropic_sse_block(&buffer, &mut anthropic_state);
+                            buffer.clear();
+                            yield Ok(Bytes::from_static(b"\n\n"));
+                        }
+                        if let Some(terminal) = anthropic_terminal_bytes(
+                            &anthropic_state,
+                            "stream_error",
+                            "Upstream stream ended with an I/O error",
+                        ) {
+                            yield Ok(terminal);
+                        }
+                    } else {
+                        yield Err(std::io::Error::other(e.to_string()));
+                    }
                     break;
                 }
                 None => {
-                    // 流正常结束
+                    if terminal_policy == SseTerminalPolicy::AnthropicMessages {
+                        if !buffer.trim().is_empty() {
+                            observe_anthropic_sse_block(&buffer, &mut anthropic_state);
+                            buffer.clear();
+                            yield Ok(Bytes::from_static(b"\n\n"));
+                        }
+                        if let Some(terminal) = anthropic_terminal_bytes(
+                            &anthropic_state,
+                            "stream_truncated",
+                            "Upstream stream ended before message_stop",
+                        ) {
+                            yield Ok(terminal);
+                        }
+                    }
                     break;
                 }
             }
@@ -932,6 +1081,69 @@ mod tests {
             Some("message_start")
         );
         assert_eq!(super::strip_sse_field("id:1", "data"), None);
+    }
+
+    #[tokio::test]
+    async fn anthropic_clean_eof_without_terminal_emits_protocol_error() {
+        let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        ))]);
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::AnthropicMessages,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(output.iter().all(Result::is_ok));
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("stream_truncated"), "{text}");
+        assert!(!text.contains("event: message_stop"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_io_error_is_encoded_as_sse_not_body_error() {
+        let source = futures::stream::iter(vec![Err::<Bytes, std::io::Error>(
+            std::io::Error::other("disconnected"),
+        )]);
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::AnthropicMessages,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(output.iter().all(Result::is_ok));
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("stream_error"), "{text}");
     }
 
     #[test]

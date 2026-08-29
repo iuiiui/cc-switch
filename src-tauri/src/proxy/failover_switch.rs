@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 /// 负责处理故障转移成功后的供应商切换，确保 UI 能够直观反映当前使用的供应商。
 #[derive(Clone)]
 pub struct FailoverSwitchManager {
-    /// 正在处理中的切换（key = "app_type:provider_id"）
+    /// 正在处理中的切换（key = app_type，同一应用不同目标也必须互斥）
     pending_switches: Arc<RwLock<HashSet<String>>>,
     db: Arc<Database>,
 }
@@ -45,7 +45,43 @@ impl FailoverSwitchManager {
         provider_id: &str,
         provider_name: &str,
     ) -> Result<bool, AppError> {
-        let switch_key = format!("{app_type}:{provider_id}");
+        self.try_switch_inner(
+            app_handle,
+            app_type,
+            provider_id,
+            provider_name,
+            SwitchExpectation::Unconditional,
+        )
+        .await
+    }
+
+    pub async fn try_switch_if_current(
+        &self,
+        app_handle: Option<&tauri::AppHandle>,
+        app_type: &str,
+        expected_current: Option<&str>,
+        provider_id: &str,
+        provider_name: &str,
+    ) -> Result<bool, AppError> {
+        self.try_switch_inner(
+            app_handle,
+            app_type,
+            provider_id,
+            provider_name,
+            SwitchExpectation::IfCurrent(expected_current),
+        )
+        .await
+    }
+
+    async fn try_switch_inner(
+        &self,
+        app_handle: Option<&tauri::AppHandle>,
+        app_type: &str,
+        provider_id: &str,
+        provider_name: &str,
+        expectation: SwitchExpectation<'_>,
+    ) -> Result<bool, AppError> {
+        let switch_key = app_type.to_string();
 
         // 去重检查：如果相同切换已在进行中，跳过
         {
@@ -59,7 +95,13 @@ impl FailoverSwitchManager {
 
         // 执行切换（确保最后清理 pending 标记）
         let result = self
-            .do_switch(app_handle, app_type, provider_id, provider_name)
+            .do_switch(
+                app_handle,
+                app_type,
+                provider_id,
+                provider_name,
+                expectation,
+            )
             .await;
 
         // 清理 pending 标记
@@ -77,6 +119,7 @@ impl FailoverSwitchManager {
         app_type: &str,
         provider_id: &str,
         provider_name: &str,
+        expectation: SwitchExpectation<'_>,
     ) -> Result<bool, AppError> {
         // 检查该应用是否已被代理接管（enabled=true）
         // 只有被接管的应用才允许执行故障转移切换
@@ -94,23 +137,39 @@ impl FailoverSwitchManager {
             return Ok(false);
         }
 
-        log::info!("[FO-001] 切换: {app_type} → {provider_name}");
-
         let mut switched = false;
 
         if let Some(app) = app_handle {
             if let Some(app_state) = app.try_state::<crate::store::AppState>() {
                 switched = if is_claude_desktop {
-                    let previous = crate::settings::get_effective_current_provider(
-                        app_state.db.as_ref(),
-                        &crate::app_config::AppType::ClaudeDesktop,
-                    )?;
-                    crate::services::ProviderService::switch(
-                        app_state.inner(),
-                        crate::app_config::AppType::ClaudeDesktop,
-                        provider_id,
-                    )?;
-                    previous.as_deref() != Some(provider_id)
+                    match expectation {
+                        SwitchExpectation::IfCurrent(expected) => {
+                            matches!(
+                                crate::services::ProviderService::switch_claude_desktop_if_current(
+                                    app_state.inner(),
+                                    expected,
+                                    provider_id,
+                                )?,
+                                crate::services::provider::ConditionalSwitchOutcome::Applied
+                            )
+                        }
+                        SwitchExpectation::Unconditional => {
+                            let previous = crate::settings::get_effective_current_provider(
+                                app_state.db.as_ref(),
+                                &crate::app_config::AppType::ClaudeDesktop,
+                            )?;
+                            if previous.as_deref() == Some(provider_id) {
+                                false
+                            } else {
+                                crate::services::ProviderService::switch(
+                                    app_state.inner(),
+                                    crate::app_config::AppType::ClaudeDesktop,
+                                    provider_id,
+                                )?;
+                                true
+                            }
+                        }
+                    }
                 } else {
                     app_state
                         .proxy_service
@@ -123,6 +182,8 @@ impl FailoverSwitchManager {
                 if !switched {
                     return Ok(false);
                 }
+
+                log::info!("[FO-001] 切换: {app_type} → {provider_name}");
 
                 if let Ok(new_menu) = crate::tray::create_tray_menu(app, app_state.inner()) {
                     if let Some(tray) = app.tray_by_id(crate::tray::TRAY_ID) {
@@ -146,4 +207,10 @@ impl FailoverSwitchManager {
 
         Ok(switched)
     }
+}
+
+#[derive(Clone, Copy)]
+enum SwitchExpectation<'a> {
+    Unconditional,
+    IfCurrent(Option<&'a str>),
 }

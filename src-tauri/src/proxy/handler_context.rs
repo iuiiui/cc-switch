@@ -107,8 +107,12 @@ impl RequestContext {
         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
         let copilot_optimizer_config = state.db.get_copilot_optimizer_config().unwrap_or_default();
 
+        // 与 ProviderRouter 使用同一个“effective current”来源；仅有数据库
+        // current、没有本地 settings 时也必须把真实 expected 带入切换 CAS。
         let current_provider_id =
-            crate::settings::get_current_provider(&app_type).unwrap_or_default();
+            crate::settings::get_effective_current_provider(&state.db, &app_type)
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
+                .unwrap_or_default();
 
         // 从请求体提取模型名称
         let request_model = body

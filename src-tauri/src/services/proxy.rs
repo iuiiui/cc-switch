@@ -968,9 +968,9 @@ impl ProxyService {
             });
         }
 
-        // 新版本首次启动本地路由时重新投影当前 Claude Desktop proxy profile。
-        // 这会备份并关闭 Claude 自带的 coworkModelAutoFallbackByAccount，确保
-        // 供应商轮转只由 CC Switch 执行；Direct/Official 模式不在这里改写。
+        // 新版本首次启动本地路由时重新投影当前 Claude Desktop proxy profile，
+        // 并把本地 Claude Code agent 的网络重试设为 0。供应商轮询因此只由
+        // CC Switch 当前入站请求完成；Direct/Official 模式会恢复用户原值。
         if let Ok(Some(current_id)) = crate::settings::get_effective_current_provider(
             self.db.as_ref(),
             &AppType::ClaudeDesktop,
