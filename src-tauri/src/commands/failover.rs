@@ -11,7 +11,7 @@ use tauri::Emitter;
 fn require_failover_app(app_type: &str) -> Result<(), String> {
     let app = crate::app_config::AppType::from_str(app_type)
         .map_err(|error| format!("无效的应用类型: {error}"))?;
-    if !app.supports_local_proxy() {
+    if !app.supports_local_proxy() && !matches!(app, crate::app_config::AppType::ClaudeDesktop) {
         return Err(format!("{} 不支持故障转移", app.as_str()));
     }
     Ok(())
@@ -42,7 +42,57 @@ mod tests {
     #[test]
     fn failover_rejects_apps_without_a_proxy_data_plane() {
         assert!(require_failover_app("claude").is_ok());
+        assert!(require_failover_app("claude-desktop").is_ok());
         assert!(require_failover_app("pi").is_err());
+    }
+
+    #[test]
+    fn failover_accepts_only_claude_desktop_proxy_providers() {
+        use crate::provider::{ClaudeDesktopMode, ClaudeDesktopModelRoute};
+
+        let db = Database::memory().expect("memory db");
+        let direct = Provider::with_id(
+            "desktop-direct".to_string(),
+            "Desktop Direct".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://example.com",
+                    "ANTHROPIC_AUTH_TOKEN": "token"
+                }
+            }),
+            None,
+        );
+        db.save_provider("claude-desktop", &direct)
+            .expect("save direct provider");
+
+        let mut proxy = Provider::with_id(
+            "desktop-proxy".to_string(),
+            "Desktop Proxy".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://example.com",
+                    "ANTHROPIC_AUTH_TOKEN": "token"
+                }
+            }),
+            None,
+        );
+        proxy.meta = Some(ProviderMeta {
+            claude_desktop_mode: Some(ClaudeDesktopMode::Proxy),
+            claude_desktop_model_routes: std::collections::HashMap::from([(
+                "claude-sonnet-4-6".to_string(),
+                ClaudeDesktopModelRoute {
+                    model: "upstream-model".to_string(),
+                    label_override: None,
+                    supports_1m: None,
+                },
+            )]),
+            ..Default::default()
+        });
+        db.save_provider("claude-desktop", &proxy)
+            .expect("save proxy provider");
+
+        assert!(require_failover_provider(&db, "claude-desktop", &direct.id).is_err());
+        assert!(require_failover_provider(&db, "claude-desktop", &proxy.id).is_ok());
     }
 
     #[test]
@@ -80,9 +130,6 @@ pub async fn get_failover_queue(
         .db
         .get_failover_queue(&app_type)
         .map_err(|e| e.to_string())?;
-    if app_type != "codex" {
-        return Ok(queue);
-    }
     let providers = state
         .db
         .get_all_providers(&app_type)
@@ -160,6 +207,31 @@ pub async fn get_auto_failover_enabled(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_failover_policy(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+) -> Result<crate::proxy::types::FailoverPolicy, String> {
+    require_failover_app(&app_type)?;
+    state
+        .db
+        .get_failover_policy(&app_type)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn update_failover_policy(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+    policy: crate::proxy::types::FailoverPolicy,
+) -> Result<(), String> {
+    require_failover_app(&app_type)?;
+    state
+        .db
+        .set_failover_policy(&app_type, &policy)
+        .map_err(|error| error.to_string())
+}
+
 /// 设置指定应用的自动故障转移开关状态（写入 proxy_config 表）
 ///
 /// 注意：关闭故障转移时不会清除队列，队列内容会保留供下次开启时使用
@@ -182,13 +254,31 @@ pub async fn set_auto_failover_enabled(
         .await
         .map_err(|e| e.to_string())?;
 
-    if enabled && !config.enabled {
+    let app_enum = crate::app_config::AppType::from_str(&app_type)
+        .map_err(|_| format!("无效的应用类型: {app_type}"))?;
+    let is_claude_desktop = matches!(app_enum, crate::app_config::AppType::ClaudeDesktop);
+
+    if enabled && !config.enabled && !is_claude_desktop {
         return Err("需要先启用该应用的代理接管，再开启故障转移".to_string());
     }
 
-    // 队列为空时把当前供应商自动加入作为 P1，避免用户陷入"必须先加队列才能开启"的死锁
+    if enabled && is_claude_desktop && !state.proxy_service.is_running().await {
+        return Err("需要先启动本地路由服务，再开启 Claude Desktop 故障转移".to_string());
+    }
+
+    let policy = state
+        .db
+        .get_failover_policy(&app_type)
+        .map_err(|error| error.to_string())?;
+    let sticky_rotation = matches!(
+        policy.strategy,
+        crate::proxy::types::FailoverStrategy::StickyRotation
+    );
+
+    // 固定优先级模式在队列为空时自动加入当前供应商作为 P1；当前优先轮转模式
+    // 始终确保当前供应商在环形队列中，但不会主动切换到列表第一项。
     let mut auto_added_provider_id: Option<String> = None;
-    let p1_provider_id = if enabled {
+    let activation_provider_id = if enabled {
         let all_providers = state
             .db
             .get_all_providers(&app_type)
@@ -209,58 +299,84 @@ pub async fn set_auto_failover_enabled(
             })
             .collect::<Vec<_>>();
 
-        if queue.is_empty() {
-            let app_enum = crate::app_config::AppType::from_str(&app_type)
-                .map_err(|_| format!("无效的应用类型: {app_type}"))?;
+        let current_id = crate::settings::get_effective_current_provider(&state.db, &app_enum)
+            .map_err(|e| e.to_string())?;
 
-            let current_id = crate::settings::get_effective_current_provider(&state.db, &app_enum)
-                .map_err(|e| e.to_string())?;
-
+        if sticky_rotation {
             let Some(current_id) = current_id else {
-                return Err("故障转移队列为空，且未设置当前供应商，无法开启故障转移".to_string());
+                return Err("未设置当前供应商，无法开启当前优先轮转".to_string());
             };
-
             require_failover_provider(&state.db, &app_type, &current_id)?;
+            if !queue.iter().any(|item| item.provider_id == current_id) {
+                state
+                    .db
+                    .add_to_failover_queue(&app_type, &current_id)
+                    .map_err(|e| e.to_string())?;
+                auto_added_provider_id = Some(current_id);
+            }
+            None
+        } else {
+            if queue.is_empty() {
+                let Some(current_id) = current_id else {
+                    return Err(
+                        "故障转移队列为空，且未设置当前供应商，无法开启故障转移".to_string()
+                    );
+                };
 
-            state
-                .db
-                .add_to_failover_queue(&app_type, &current_id)
-                .map_err(|e| e.to_string())?;
-            auto_added_provider_id = Some(current_id);
+                require_failover_provider(&state.db, &app_type, &current_id)?;
 
-            queue = state
-                .db
-                .get_failover_queue(&app_type)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .filter(|item| {
-                    all_providers
-                        .get(&item.provider_id)
-                        .is_some_and(|provider| {
-                            crate::proxy::provider_router::provider_supports_failover(
-                                &app_type, provider,
-                            )
-                        })
-                })
-                .collect();
+                state
+                    .db
+                    .add_to_failover_queue(&app_type, &current_id)
+                    .map_err(|e| e.to_string())?;
+                auto_added_provider_id = Some(current_id);
+
+                queue = state
+                    .db
+                    .get_failover_queue(&app_type)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter(|item| {
+                        all_providers
+                            .get(&item.provider_id)
+                            .is_some_and(|provider| {
+                                crate::proxy::provider_router::provider_supports_failover(
+                                    &app_type, provider,
+                                )
+                            })
+                    })
+                    .collect();
+            }
+
+            Some(
+                queue
+                    .first()
+                    .map(|item| item.provider_id.clone())
+                    .ok_or_else(|| "故障转移队列为空，无法开启故障转移".to_string())?,
+            )
         }
-
-        queue
-            .first()
-            .map(|item| item.provider_id.clone())
-            .ok_or_else(|| "故障转移队列为空，无法开启故障转移".to_string())?
     } else {
-        String::new()
+        None
     };
 
     // 开启前先切到 P1。只有切换成功后才写入 auto_failover_enabled=true，
     // 避免 P1 不可切换（例如 official provider）时留下“开关已开但目标未切”的脏状态。
-    if enabled {
-        if let Err(e) = state
-            .proxy_service
-            .switch_proxy_target(&app_type, &p1_provider_id)
-            .await
-        {
+    if let Some(p1_provider_id) = activation_provider_id.as_deref() {
+        let switch_result = if is_claude_desktop {
+            crate::services::ProviderService::switch(
+                state.inner(),
+                crate::app_config::AppType::ClaudeDesktop,
+                p1_provider_id,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        } else {
+            state
+                .proxy_service
+                .switch_proxy_target(&app_type, p1_provider_id)
+                .await
+        };
+        if let Err(e) = switch_result {
             if let Some(provider_id) = auto_added_provider_id {
                 let _ = state.db.remove_from_failover_queue(&app_type, &provider_id);
             }
@@ -278,11 +394,11 @@ pub async fn set_auto_failover_enabled(
         .await
         .map_err(|e| e.to_string())?;
 
-    if enabled {
+    if let Some(provider_id) = activation_provider_id {
         // 发射 provider-switched 事件（让前端刷新当前供应商）
         let event_data = serde_json::json!({
             "appType": app_type,
-            "providerId": p1_provider_id,
+            "providerId": provider_id,
             "source": "failoverEnabled"
         });
         let _ = app.emit("provider-switched", event_data);

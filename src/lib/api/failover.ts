@@ -4,6 +4,7 @@ import type {
   CircuitBreakerConfig,
   CircuitBreakerStats,
   FailoverQueueItem,
+  FailoverPolicy,
 } from "@/types/proxy";
 
 export interface Provider {
@@ -95,5 +96,16 @@ export const failoverApi = {
     enabled: boolean,
   ): Promise<void> {
     return invoke("set_auto_failover_enabled", { appType, enabled });
+  },
+
+  async getFailoverPolicy(appType: string): Promise<FailoverPolicy> {
+    return invoke("get_failover_policy", { appType });
+  },
+
+  async updateFailoverPolicy(
+    appType: string,
+    policy: FailoverPolicy,
+  ): Promise<void> {
+    return invoke("update_failover_policy", { appType, policy });
   },
 };

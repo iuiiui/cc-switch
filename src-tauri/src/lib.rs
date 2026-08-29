@@ -1587,6 +1587,8 @@ pub fn run() {
             commands::remove_from_failover_queue,
             commands::get_auto_failover_enabled,
             commands::set_auto_failover_enabled,
+            commands::get_failover_policy,
+            commands::update_failover_policy,
             // Usage statistics
             commands::get_usage_summary,
             commands::get_usage_summary_by_app,

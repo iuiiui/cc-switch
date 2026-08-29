@@ -7,6 +7,18 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Save, Loader2, Info } from "lucide-react";
 import { toast } from "sonner";
 import { useAppProxyConfig, useUpdateAppProxyConfig } from "@/lib/query/proxy";
+import {
+  useFailoverPolicy,
+  useUpdateFailoverPolicy,
+} from "@/lib/query/failover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import type { FailoverStrategy } from "@/types/proxy";
 
 export interface AutoFailoverConfigPanelProps {
   appType: string;
@@ -20,6 +32,12 @@ export function AutoFailoverConfigPanel({
   const { t } = useTranslation();
   const { data: config, isLoading, error } = useAppProxyConfig(appType);
   const updateConfig = useUpdateAppProxyConfig();
+  const { data: policy, isLoading: isPolicyLoading } =
+    useFailoverPolicy(appType);
+  const updatePolicy = useUpdateFailoverPolicy();
+  const [strategy, setStrategy] = useState<FailoverStrategy>("priority");
+  const [rateLimitCooldown, setRateLimitCooldown] = useState("60");
+  const [maxRateLimitCooldown, setMaxRateLimitCooldown] = useState("3600");
 
   // 使用字符串状态以支持完全清空数字输入框
   const [formData, setFormData] = useState({
@@ -54,6 +72,14 @@ export function AutoFailoverConfigPanel({
     }
   }, [config]);
 
+  useEffect(() => {
+    if (policy) {
+      setStrategy(policy.strategy);
+      setRateLimitCooldown(String(policy.rateLimitCooldownSeconds));
+      setMaxRateLimitCooldown(String(policy.maxRateLimitCooldownSeconds));
+    }
+  }, [policy]);
+
   const handleSave = async () => {
     if (!config) return;
     // 解析数字，返回 NaN 表示无效输入
@@ -75,6 +101,8 @@ export function AutoFailoverConfigPanel({
       circuitTimeoutSeconds: { min: 0, max: 300 },
       circuitErrorRateThreshold: { min: 0, max: 100 },
       circuitMinRequests: { min: 5, max: 100 },
+      rateLimitCooldown: { min: 1, max: 86400 },
+      maxRateLimitCooldown: { min: 1, max: 86400 },
     };
 
     // 解析原始值
@@ -88,6 +116,8 @@ export function AutoFailoverConfigPanel({
       circuitTimeoutSeconds: parseNum(formData.circuitTimeoutSeconds),
       circuitErrorRateThreshold: parseNum(formData.circuitErrorRateThreshold),
       circuitMinRequests: parseNum(formData.circuitMinRequests),
+      rateLimitCooldown: parseNum(rateLimitCooldown),
+      maxRateLimitCooldown: parseNum(maxRateLimitCooldown),
     };
 
     // 校验是否超出范围（NaN 也视为无效）
@@ -147,6 +177,24 @@ export function AutoFailoverConfigPanel({
       ranges.circuitMinRequests,
       t("proxy.autoFailover.minRequests", "最小请求数"),
     );
+    checkRange(
+      raw.rateLimitCooldown,
+      ranges.rateLimitCooldown,
+      t("proxy.autoFailover.rateLimitCooldown", "速率限制默认冷却时间"),
+    );
+    checkRange(
+      raw.maxRateLimitCooldown,
+      ranges.maxRateLimitCooldown,
+      t("proxy.autoFailover.maxRateLimitCooldown", "速率限制最大冷却时间"),
+    );
+    if (raw.rateLimitCooldown > raw.maxRateLimitCooldown) {
+      errors.push(
+        t(
+          "proxy.autoFailover.cooldownOrderInvalid",
+          "默认冷却时间不能超过最大冷却时间",
+        ),
+      );
+    }
 
     if (errors.length > 0) {
       toast.error(
@@ -159,20 +207,30 @@ export function AutoFailoverConfigPanel({
     }
 
     try {
-      await updateConfig.mutateAsync({
-        appType,
-        enabled: config.enabled,
-        autoFailoverEnabled: formData.autoFailoverEnabled,
-        maxRetries: raw.maxRetries,
-        streamingFirstByteTimeout: raw.streamingFirstByteTimeout,
-        streamingIdleTimeout: raw.streamingIdleTimeout,
-        nonStreamingTimeout: raw.nonStreamingTimeout,
-        circuitFailureThreshold: raw.circuitFailureThreshold,
-        circuitSuccessThreshold: raw.circuitSuccessThreshold,
-        circuitTimeoutSeconds: raw.circuitTimeoutSeconds,
-        circuitErrorRateThreshold: raw.circuitErrorRateThreshold / 100,
-        circuitMinRequests: raw.circuitMinRequests,
-      });
+      await Promise.all([
+        updateConfig.mutateAsync({
+          appType,
+          enabled: config.enabled,
+          autoFailoverEnabled: formData.autoFailoverEnabled,
+          maxRetries: raw.maxRetries,
+          streamingFirstByteTimeout: raw.streamingFirstByteTimeout,
+          streamingIdleTimeout: raw.streamingIdleTimeout,
+          nonStreamingTimeout: raw.nonStreamingTimeout,
+          circuitFailureThreshold: raw.circuitFailureThreshold,
+          circuitSuccessThreshold: raw.circuitSuccessThreshold,
+          circuitTimeoutSeconds: raw.circuitTimeoutSeconds,
+          circuitErrorRateThreshold: raw.circuitErrorRateThreshold / 100,
+          circuitMinRequests: raw.circuitMinRequests,
+        }),
+        updatePolicy.mutateAsync({
+          appType,
+          policy: {
+            strategy,
+            rateLimitCooldownSeconds: raw.rateLimitCooldown,
+            maxRateLimitCooldownSeconds: raw.maxRateLimitCooldown,
+          },
+        }),
+      ]);
       toast.success(
         t("proxy.autoFailover.configSaved", "自动故障转移配置已保存"),
         { closeButton: true },
@@ -201,9 +259,14 @@ export function AutoFailoverConfigPanel({
         circuitMinRequests: String(config.circuitMinRequests),
       });
     }
+    if (policy) {
+      setStrategy(policy.strategy);
+      setRateLimitCooldown(String(policy.rateLimitCooldownSeconds));
+      setMaxRateLimitCooldown(String(policy.maxRateLimitCooldownSeconds));
+    }
   };
 
-  if (isLoading) {
+  if (isLoading || isPolicyLoading) {
     return (
       <div className="flex items-center justify-center p-4">
         <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
@@ -211,7 +274,8 @@ export function AutoFailoverConfigPanel({
     );
   }
 
-  const isDisabled = disabled || updateConfig.isPending;
+  const isDisabled =
+    disabled || updateConfig.isPending || updatePolicy.isPending;
 
   return (
     <div className="border-0 rounded-none shadow-none bg-transparent">
@@ -231,6 +295,84 @@ export function AutoFailoverConfigPanel({
             )}
           </AlertDescription>
         </Alert>
+
+        <div className="space-y-4 rounded-lg border border-white/10 bg-muted/30 p-4">
+          <div className="space-y-2">
+            <Label htmlFor={`failover-strategy-${appType}`}>
+              {t("proxy.autoFailover.strategy", "故障转移策略")}
+            </Label>
+            <Select
+              value={strategy}
+              onValueChange={(value) => setStrategy(value as FailoverStrategy)}
+              disabled={isDisabled}
+            >
+              <SelectTrigger id={`failover-strategy-${appType}`}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="priority">
+                  {t("proxy.autoFailover.strategyPriority", "固定优先级")}
+                </SelectItem>
+                <SelectItem value="stickyRotation">
+                  {t(
+                    "proxy.autoFailover.strategyStickyRotation",
+                    "当前优先轮转",
+                  )}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {strategy === "stickyRotation"
+                ? t(
+                    "proxy.autoFailover.strategyStickyRotationHint",
+                    "保留当前供应商；失败后按环形顺序轮转，成功者成为新的当前供应商，不会主动切回队首。",
+                  )
+                : t(
+                    "proxy.autoFailover.strategyPriorityHint",
+                    "启用时立即切换到队列 P1，后续始终按固定优先级尝试。",
+                  )}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor={`rate-limit-cooldown-${appType}`}>
+                {t(
+                  "proxy.autoFailover.rateLimitCooldown",
+                  "速率限制默认冷却时间（秒）",
+                )}
+              </Label>
+              <Input
+                id={`rate-limit-cooldown-${appType}`}
+                type="number"
+                min="1"
+                max="86400"
+                value={rateLimitCooldown}
+                onChange={(event) => setRateLimitCooldown(event.target.value)}
+                disabled={isDisabled}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor={`max-rate-limit-cooldown-${appType}`}>
+                {t(
+                  "proxy.autoFailover.maxRateLimitCooldown",
+                  "速率限制最大冷却时间（秒）",
+                )}
+              </Label>
+              <Input
+                id={`max-rate-limit-cooldown-${appType}`}
+                type="number"
+                min="1"
+                max="86400"
+                value={maxRateLimitCooldown}
+                onChange={(event) =>
+                  setMaxRateLimitCooldown(event.target.value)
+                }
+                disabled={isDisabled}
+              />
+            </div>
+          </div>
+        </div>
 
         {/* 重试与超时配置 */}
         <div className="space-y-4 rounded-lg border border-white/10 bg-muted/30 p-4">

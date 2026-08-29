@@ -1055,6 +1055,18 @@ impl RequestForwarder {
 
                     match category {
                         ErrorCategory::Retryable => {
+                            if is_rate_limit_error(&e) {
+                                if let Err(error) = self
+                                    .router
+                                    .mark_provider_rate_limited(&provider.id, app_type_str)
+                                    .await
+                                {
+                                    log::warn!(
+                                        "[{app_type_str}] 记录供应商 {} 的速率限制冷却失败: {error}",
+                                        provider.id
+                                    );
+                                }
+                            }
                             // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
                             let _ = self
                                 .router
@@ -2807,6 +2819,35 @@ impl RequestForwarder {
     }
 }
 
+fn is_rate_limit_error(error: &ProxyError) -> bool {
+    if matches!(error, ProxyError::UpstreamError { status: 429, .. }) {
+        return true;
+    }
+
+    let text = match error {
+        ProxyError::UpstreamError { body, .. } => body.as_deref().unwrap_or_default(),
+        ProxyError::TransformError(message)
+        | ProxyError::ForwardFailed(message)
+        | ProxyError::ProviderUnhealthy(message) => message,
+        _ => return false,
+    }
+    .to_ascii_lowercase();
+
+    [
+        "rate_limit",
+        "rate limit",
+        "too many requests",
+        "resource_exhausted",
+        "resource exhausted",
+        "quota exceeded",
+        "quota exhausted",
+        "insufficient_quota",
+        "insufficient quota",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
+}
+
 /// 从 ProxyError 中提取错误消息
 fn extract_error_message(error: &ProxyError) -> Option<String> {
     match error {
@@ -3815,6 +3856,25 @@ mod tests {
         // 上游错误消息保留(截断)，用于诊断失败原因。
         assert!(message.contains("rate limit exceeded"));
         assert!(!message.contains("切换下一个"));
+    }
+
+    #[test]
+    fn detects_rate_limit_status_and_vendor_signals() {
+        assert!(is_rate_limit_error(&ProxyError::UpstreamError {
+            status: 429,
+            body: None,
+        }));
+        assert!(is_rate_limit_error(&ProxyError::UpstreamError {
+            status: 403,
+            body: Some(r#"{"error":{"code":"insufficient_quota"}}"#.to_string()),
+        }));
+        assert!(is_rate_limit_error(&ProxyError::TransformError(
+            "RESOURCE_EXHAUSTED".to_string()
+        )));
+        assert!(!is_rate_limit_error(&ProxyError::UpstreamError {
+            status: 403,
+            body: Some("permission denied".to_string()),
+        }));
     }
 
     #[test]

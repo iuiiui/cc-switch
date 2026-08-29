@@ -270,6 +270,9 @@ export function useSetAutoFailoverEnabled() {
       queryClient.invalidateQueries({
         queryKey: ["autoFailoverEnabled", variables.appType],
       });
+      queryClient.invalidateQueries({
+        queryKey: proxyKeys.appConfig(variables.appType),
+      });
       // 启用/关闭故障转移可能触发：
       // - 立即切到队列 P1（当前供应商变化）
       // - 队列为空时自动把当前供应商加入队列（队列内容变化）
@@ -284,6 +287,33 @@ export function useSetAutoFailoverEnabled() {
       });
       queryClient.invalidateQueries({
         queryKey: proxyKeys.status,
+      });
+    },
+  });
+}
+
+export function useFailoverPolicy(appType: string) {
+  return useQuery({
+    queryKey: ["failoverPolicy", appType],
+    queryFn: () => failoverApi.getFailoverPolicy(appType),
+    enabled: !!appType,
+  });
+}
+
+export function useUpdateFailoverPolicy() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      appType,
+      policy,
+    }: {
+      appType: string;
+      policy: import("@/types/proxy").FailoverPolicy;
+    }) => failoverApi.updateFailoverPolicy(appType, policy),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["failoverPolicy", variables.appType],
       });
     },
   });

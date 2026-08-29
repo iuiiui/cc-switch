@@ -10,12 +10,22 @@ use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerC
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Codex Official requests carry the selected account's native Authorization
 /// header. Reusing that request against another account card would cross the
 /// account boundary, so these cards must never participate in provider retry.
 pub(crate) fn provider_supports_failover(app_type: &str, provider: &Provider) -> bool {
+    if app_type == AppType::ClaudeDesktop.as_str() {
+        return !crate::claude_desktop_config::is_official_provider(provider)
+            && matches!(
+                crate::claude_desktop_config::provider_mode(provider),
+                crate::provider::ClaudeDesktopMode::Proxy
+            )
+            && crate::claude_desktop_config::validate_proxy_provider(provider).is_ok();
+    }
+
     app_type != AppType::Codex.as_str()
         || !crate::proxy::providers::is_codex_official_provider(provider)
 }
@@ -26,6 +36,8 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// 429/配额耗尽后的短期冷却，进程重启后自然清空。
+    rate_limit_cooldowns: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl ProviderRouter {
@@ -34,6 +46,7 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            rate_limit_cooldowns: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -68,6 +81,7 @@ impl ProviderRouter {
                 false
             }
         };
+        let policy = self.db.get_failover_policy(app_type).unwrap_or_default();
 
         if auto_failover_enabled
             && current_provider
@@ -84,12 +98,23 @@ impl ProviderRouter {
             let all_providers = self.db.get_all_providers(app_type)?;
 
             // 使用 DAO 返回的排序结果，确保和前端展示一致
-            let ordered_ids: Vec<String> = self
+            let mut ordered_ids: Vec<String> = self
                 .db
                 .get_failover_queue(app_type)?
                 .into_iter()
                 .map(|item| item.provider_id)
                 .collect();
+
+            if matches!(
+                policy.strategy,
+                crate::proxy::types::FailoverStrategy::StickyRotation
+            ) {
+                if let Some(current_id) = current_id.as_deref() {
+                    if let Some(index) = ordered_ids.iter().position(|id| id == current_id) {
+                        ordered_ids.rotate_left(index);
+                    }
+                }
+            }
 
             for provider_id in ordered_ids {
                 let Some(provider) = all_providers.get(&provider_id).cloned() else {
@@ -99,6 +124,15 @@ impl ProviderRouter {
                     continue;
                 }
                 total_providers += 1;
+
+                if matches!(
+                    policy.strategy,
+                    crate::proxy::types::FailoverStrategy::StickyRotation
+                ) && self.is_provider_rate_limited(&provider.id, app_type).await
+                {
+                    circuit_open_count += 1;
+                    continue;
+                }
 
                 let circuit_key = format!("{app_type}:{}", provider.id);
                 let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
@@ -128,6 +162,46 @@ impl ProviderRouter {
         }
 
         Ok(result)
+    }
+
+    pub async fn mark_provider_rate_limited(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Result<Duration, AppError> {
+        let policy = self.db.get_failover_policy(app_type)?;
+        if !matches!(
+            policy.strategy,
+            crate::proxy::types::FailoverStrategy::StickyRotation
+        ) {
+            return Ok(Duration::ZERO);
+        }
+
+        let seconds = policy
+            .rate_limit_cooldown_seconds
+            .min(policy.max_rate_limit_cooldown_seconds)
+            .max(1);
+        let duration = Duration::from_secs(seconds as u64);
+        let key = format!("{app_type}:{provider_id}");
+        self.rate_limit_cooldowns
+            .write()
+            .await
+            .insert(key, Instant::now() + duration);
+        log::warn!("[{app_type}] 供应商 {provider_id} 触发速率限制，冷却 {seconds} 秒后再参与轮转");
+        Ok(duration)
+    }
+
+    pub async fn is_provider_rate_limited(&self, provider_id: &str, app_type: &str) -> bool {
+        let key = format!("{app_type}:{provider_id}");
+        let mut cooldowns = self.rate_limit_cooldowns.write().await;
+        match cooldowns.get(&key).copied() {
+            Some(until) if until > Instant::now() => true,
+            Some(_) => {
+                cooldowns.remove(&key);
+                false
+            }
+            None => false,
+        }
     }
 
     /// 请求执行前获取熔断器“放行许可”
@@ -436,6 +510,60 @@ mod tests {
         // 故障转移开启时：仅按队列顺序选择（忽略当前供应商）
         assert_eq!(providers[0].id, "b");
         assert_eq!(providers[1].id, "a");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sticky_rotation_starts_from_current_and_skips_rate_limited_provider() {
+        use crate::proxy::types::{FailoverPolicy, FailoverStrategy};
+
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        for (id, sort_index) in [("a", 1), ("b", 2), ("c", 3)] {
+            let mut provider =
+                Provider::with_id(id.to_string(), format!("Provider {id}"), json!({}), None);
+            provider.sort_index = Some(sort_index);
+            db.save_provider("claude", &provider).unwrap();
+            db.add_to_failover_queue("claude", id).unwrap();
+        }
+        db.set_current_provider("claude", "b").unwrap();
+        crate::settings::set_current_provider(&AppType::Claude, Some("b")).unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        db.set_failover_policy(
+            "claude",
+            &FailoverPolicy {
+                strategy: FailoverStrategy::StickyRotation,
+                rate_limit_cooldown_seconds: 60,
+                max_rate_limit_cooldown_seconds: 3600,
+            },
+        )
+        .unwrap();
+
+        let router = ProviderRouter::new(db);
+        let providers = router.select_providers("claude").await.unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "a"]
+        );
+
+        router
+            .mark_provider_rate_limited("b", "claude")
+            .await
+            .unwrap();
+        let providers = router.select_providers("claude").await.unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "a"]
+        );
     }
 
     #[tokio::test]

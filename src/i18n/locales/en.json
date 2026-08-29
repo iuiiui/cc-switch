@@ -2895,12 +2895,15 @@
     "failover": {
       "proxyRequired": "Routing service must be started to configure failover",
       "autoSwitch": "Auto Failover",
-      "autoSwitchDescription": "When enabled, switches to queue P1 immediately and automatically tries the next provider in the queue on failures"
+      "autoSwitchDescription": "When enabled, switches to queue P1 immediately and automatically tries the next provider in the queue on failures",
+      "stickyAutoSwitchDescription": "Keep the current provider and rotate in a ring after failures; the successful provider becomes current"
     },
     "failoverQueue": {
       "title": "Failover Queue",
       "description": "Manage failover order for each app's providers",
       "info": "When auto failover is enabled, requests follow the queue priority order (P1 first). On failures, the system will try the next provider in the queue.",
+      "stickyInfo": "The current provider is the dynamic primary. Failures rotate to the next provider in the ring; the successful provider becomes current and recovery does not switch back to the queue head.",
+      "claudeDesktopProxyOnly": "Claude Desktop can automatically fail over only between local-routing providers. Direct and official providers are excluded from the list.",
       "selectProvider": "Select a provider to add to queue",
       "noAvailableProviders": "No providers available to add",
       "empty": "Failover queue is empty. Add providers to enable automatic failover.",
@@ -2920,6 +2923,14 @@
       "configSaved": "Auto failover config saved",
       "configSaveFailed": "Failed to save",
       "validationFailed": "The following fields are out of valid range: {{fields}}",
+      "strategy": "Failover Strategy",
+      "strategyPriority": "Fixed Priority",
+      "strategyPriorityHint": "Switch to queue P1 when enabled and always try providers in fixed priority order.",
+      "strategyStickyRotation": "Current-First Rotation",
+      "strategyStickyRotationHint": "Keep the current provider, rotate in a ring after failures, and promote the successful provider without switching back to the queue head.",
+      "rateLimitCooldown": "Default Rate-Limit Cooldown (seconds)",
+      "maxRateLimitCooldown": "Maximum Rate-Limit Cooldown (seconds)",
+      "cooldownOrderInvalid": "Default cooldown cannot exceed the maximum cooldown",
       "retrySettings": "Retry & Timeout Settings",
       "failureThreshold": "Failure Threshold",
       "failureThresholdHint": "Open circuit breaker after this many consecutive failures (recommended: 3-10)",

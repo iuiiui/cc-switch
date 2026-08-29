@@ -2895,12 +2895,15 @@
     "failover": {
       "proxyRequired": "需要先启动路由服务才能配置故障转移",
       "autoSwitch": "自动故障转移",
-      "autoSwitchDescription": "开启后将立即切换到队列 P1，并在请求失败时自动切换到队列中的下一个供应商"
+      "autoSwitchDescription": "开启后将立即切换到队列 P1，并在请求失败时自动切换到队列中的下一个供应商",
+      "stickyAutoSwitchDescription": "开启后保留当前供应商；失败时按环形顺序轮转，成功者成为新的当前供应商"
     },
     "failoverQueue": {
       "title": "故障转移队列",
       "description": "管理各应用的供应商故障转移顺序",
       "info": "启用自动故障转移后，将按队列优先级选择供应商（P1 优先）。当请求失败时，系统会按队列顺序依次尝试下一个供应商。",
+      "stickyInfo": "当前供应商是动态主供应商。失败后从它的下一位开始环形轮转，成功者成为新的当前供应商，恢复后不会自动切回队首。",
+      "claudeDesktopProxyOnly": "Claude Desktop 仅支持在本地路由模式供应商之间自动故障转移；直连和官方供应商不会出现在可选列表中。",
       "selectProvider": "选择供应商添加到队列",
       "noAvailableProviders": "没有可添加的供应商",
       "empty": "故障转移队列为空。添加供应商以启用自动故障转移。",
@@ -2920,6 +2923,14 @@
       "configSaved": "自动故障转移配置已保存",
       "configSaveFailed": "保存失败",
       "validationFailed": "以下字段超出有效范围: {{fields}}",
+      "strategy": "故障转移策略",
+      "strategyPriority": "固定优先级",
+      "strategyPriorityHint": "启用时立即切换到队列 P1，后续始终按固定优先级尝试。",
+      "strategyStickyRotation": "当前优先轮转",
+      "strategyStickyRotationHint": "保留当前供应商；失败后按环形顺序轮转，成功者成为新的当前供应商，不会主动切回队首。",
+      "rateLimitCooldown": "速率限制默认冷却时间（秒）",
+      "maxRateLimitCooldown": "速率限制最大冷却时间（秒）",
+      "cooldownOrderInvalid": "默认冷却时间不能超过最大冷却时间",
       "retrySettings": "重试与超时设置",
       "failureThreshold": "失败阈值",
       "failureThresholdHint": "连续失败多少次后打开熔断器（建议: 3-10）",

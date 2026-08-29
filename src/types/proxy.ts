@@ -116,6 +116,14 @@ export interface FailoverQueueItem {
   sortIndex?: number;
 }
 
+export type FailoverStrategy = "priority" | "stickyRotation";
+
+export interface FailoverPolicy {
+  strategy: FailoverStrategy;
+  rateLimitCooldownSeconds: number;
+  maxRateLimitCooldownSeconds: number;
+}
+
 // 全局代理配置（统一字段，三行镜像）
 export interface GlobalProxyConfig {
   proxyEnabled: boolean;

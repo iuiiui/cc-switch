@@ -2896,12 +2896,15 @@
     "failover": {
       "proxyRequired": "需要先啟動路由服務才能設定故障轉移",
       "autoSwitch": "自動故障轉移",
-      "autoSwitchDescription": "開啟後將立即切換至佇列 P1，並在請求失敗時自動切換至佇列中的下一個供應商"
+      "autoSwitchDescription": "開啟後將立即切換至佇列 P1，並在請求失敗時自動切換至佇列中的下一個供應商",
+      "stickyAutoSwitchDescription": "開啟後保留目前供應商；失敗時依環形順序輪轉，成功者成為新的目前供應商"
     },
     "failoverQueue": {
       "title": "故障轉移佇列",
       "description": "管理各應用程式的供應商故障轉移順序",
       "info": "啟用自動故障轉移後，將按佇列優先順序選擇供應商（P1 優先）。當請求失敗時，系統會按佇列順序依次嘗試下一個供應商。",
+      "stickyInfo": "目前供應商是動態主供應商。失敗後從下一位開始環形輪轉，成功者成為新的目前供應商，恢復後不會自動切回佇列開頭。",
+      "claudeDesktopProxyOnly": "Claude Desktop 僅支援在本機路由模式供應商之間自動故障轉移；直連與官方供應商不會出現在可選清單中。",
       "selectProvider": "選擇供應商新增至佇列",
       "noAvailableProviders": "沒有可新增的供應商",
       "empty": "故障轉移佇列為空。新增供應商以啟用自動故障轉移。",
@@ -2921,6 +2924,14 @@
       "configSaved": "自動故障轉移設定已儲存",
       "configSaveFailed": "儲存失敗",
       "validationFailed": "以下欄位超出有效範圍：{{fields}}",
+      "strategy": "故障轉移策略",
+      "strategyPriority": "固定優先順序",
+      "strategyPriorityHint": "啟用時立即切換至佇列 P1，之後始終依固定優先順序嘗試。",
+      "strategyStickyRotation": "目前優先輪轉",
+      "strategyStickyRotationHint": "保留目前供應商；失敗後依環形順序輪轉，成功者成為新的目前供應商，不會主動切回佇列開頭。",
+      "rateLimitCooldown": "速率限制預設冷卻時間（秒）",
+      "maxRateLimitCooldown": "速率限制最大冷卻時間（秒）",
+      "cooldownOrderInvalid": "預設冷卻時間不能超過最大冷卻時間",
       "retrySettings": "重試與逾時設定",
       "failureThreshold": "失敗閾值",
       "failureThresholdHint": "連續失敗多少次後打開斷路器（建議：3-10）",

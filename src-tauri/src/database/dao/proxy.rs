@@ -12,6 +12,11 @@ use super::super::{lock_conn, Database};
 
 pub(crate) const PRICING_SOURCE_RESPONSE: &str = "response";
 pub(crate) const PRICING_SOURCE_REQUEST: &str = "request";
+const CLAUDE_DESKTOP_PROXY_CONFIG_KEY: &str = "custom_claude_desktop_failover_config";
+
+fn failover_policy_key(app_type: &str) -> String {
+    format!("custom_failover_policy_{app_type}")
+}
 
 pub(crate) fn validate_cost_multiplier(value: &str) -> Result<Decimal, AppError> {
     let trimmed = value.trim();
@@ -53,6 +58,37 @@ pub(crate) fn validate_pricing_source(value: &str) -> Result<&str, AppError> {
 }
 
 impl Database {
+    pub fn get_failover_policy(&self, app_type: &str) -> Result<FailoverPolicy, AppError> {
+        let key = failover_policy_key(app_type);
+        match self.get_setting(&key)? {
+            Some(json) => serde_json::from_str(&json).map_err(|error| {
+                AppError::Database(format!("读取 {app_type} 故障转移策略失败: {error}"))
+            }),
+            None => Ok(FailoverPolicy::default()),
+        }
+    }
+
+    pub fn set_failover_policy(
+        &self,
+        app_type: &str,
+        policy: &FailoverPolicy,
+    ) -> Result<(), AppError> {
+        if policy.rate_limit_cooldown_seconds == 0
+            || policy.max_rate_limit_cooldown_seconds == 0
+            || policy.rate_limit_cooldown_seconds > policy.max_rate_limit_cooldown_seconds
+            || policy.max_rate_limit_cooldown_seconds > 86_400
+        {
+            return Err(AppError::Config(
+                "速率限制冷却时间必须大于 0，默认值不能超过最大值，最大值不能超过 86400 秒"
+                    .to_string(),
+            ));
+        }
+
+        let json = serde_json::to_string(policy)
+            .map_err(|error| AppError::Database(format!("保存故障转移策略失败: {error}")))?;
+        self.set_setting(&failover_policy_key(app_type), &json)
+    }
+
     // ==================== Global Proxy Config ====================
 
     /// 获取全局代理配置（统一字段）
@@ -216,6 +252,28 @@ impl Database {
         &self,
         app_type: &str,
     ) -> Result<AppProxyConfig, AppError> {
+        if app_type == "claude-desktop" {
+            return match self.get_setting(CLAUDE_DESKTOP_PROXY_CONFIG_KEY)? {
+                Some(json) => serde_json::from_str(&json).map_err(|error| {
+                    AppError::Database(format!("读取 Claude Desktop 故障转移配置失败: {error}"))
+                }),
+                None => Ok(AppProxyConfig {
+                    app_type: app_type.to_string(),
+                    enabled: false,
+                    auto_failover_enabled: false,
+                    max_retries: 3,
+                    streaming_first_byte_timeout: 60,
+                    streaming_idle_timeout: 120,
+                    non_streaming_timeout: 600,
+                    circuit_failure_threshold: 4,
+                    circuit_success_threshold: 2,
+                    circuit_timeout_seconds: 60,
+                    circuit_error_rate_threshold: 0.6,
+                    circuit_min_requests: 10,
+                }),
+            };
+        }
+
         // 使用 block 限制 conn 的作用域，避免跨 await 持有锁
         let app_type_owned = app_type.to_string();
         let result = {
@@ -276,6 +334,13 @@ impl Database {
         &self,
         config: AppProxyConfig,
     ) -> Result<(), AppError> {
+        if config.app_type == "claude-desktop" {
+            let json = serde_json::to_string(&config).map_err(|error| {
+                AppError::Database(format!("保存 Claude Desktop 故障转移配置失败: {error}"))
+            })?;
+            return self.set_setting(CLAUDE_DESKTOP_PROXY_CONFIG_KEY, &json);
+        }
+
         let conn = lock_conn!(self.conn);
 
         conn.execute(
@@ -906,6 +971,50 @@ impl Database {
 mod tests {
     use crate::database::Database;
     use crate::error::AppError;
+
+    #[tokio::test]
+    async fn claude_desktop_failover_config_round_trips_without_proxy_schema_row(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+
+        let mut config = db.get_proxy_config_for_app("claude-desktop").await?;
+        assert_eq!(config.app_type, "claude-desktop");
+        assert!(!config.auto_failover_enabled);
+
+        config.auto_failover_enabled = true;
+        config.max_retries = 5;
+        db.update_proxy_config_for_app(config).await?;
+
+        let persisted = db.get_proxy_config_for_app("claude-desktop").await?;
+        assert!(persisted.auto_failover_enabled);
+        assert_eq!(persisted.max_retries, 5);
+
+        Ok(())
+    }
+
+    #[test]
+    fn failover_policy_round_trips_without_schema_changes() -> Result<(), AppError> {
+        use crate::proxy::types::{FailoverPolicy, FailoverStrategy};
+
+        let db = Database::memory()?;
+        assert_eq!(
+            db.get_failover_policy("claude")?.strategy,
+            FailoverStrategy::Priority
+        );
+
+        let policy = FailoverPolicy {
+            strategy: FailoverStrategy::StickyRotation,
+            rate_limit_cooldown_seconds: 90,
+            max_rate_limit_cooldown_seconds: 900,
+        };
+        db.set_failover_policy("claude", &policy)?;
+        let persisted = db.get_failover_policy("claude")?;
+        assert_eq!(persisted.strategy, FailoverStrategy::StickyRotation);
+        assert_eq!(persisted.rate_limit_cooldown_seconds, 90);
+        assert_eq!(persisted.max_rate_limit_cooldown_seconds, 900);
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_default_cost_multiplier_round_trip() -> Result<(), AppError> {

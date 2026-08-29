@@ -186,6 +186,47 @@ pub struct AppProxyConfig {
     pub circuit_min_requests: u32,
 }
 
+/// 故障转移候选排序策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum FailoverStrategy {
+    /// 固定从队列 P1 开始；保持现有行为。
+    #[default]
+    Priority,
+    /// 当前供应商为动态主供应商，失败后按环形顺序轮转。
+    StickyRotation,
+}
+
+/// 独立存放在 settings 表中的自定义故障转移策略，不修改官方 proxy_config Schema。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverPolicy {
+    #[serde(default)]
+    pub strategy: FailoverStrategy,
+    #[serde(default = "default_rate_limit_cooldown_seconds")]
+    pub rate_limit_cooldown_seconds: u32,
+    #[serde(default = "default_max_rate_limit_cooldown_seconds")]
+    pub max_rate_limit_cooldown_seconds: u32,
+}
+
+const fn default_rate_limit_cooldown_seconds() -> u32 {
+    60
+}
+
+const fn default_max_rate_limit_cooldown_seconds() -> u32 {
+    3600
+}
+
+impl Default for FailoverPolicy {
+    fn default() -> Self {
+        Self {
+            strategy: FailoverStrategy::Priority,
+            rate_limit_cooldown_seconds: default_rate_limit_cooldown_seconds(),
+            max_rate_limit_cooldown_seconds: default_max_rate_limit_cooldown_seconds(),
+        }
+    }
+}
+
 /// 整流器配置
 ///
 /// 存储在 settings 表中

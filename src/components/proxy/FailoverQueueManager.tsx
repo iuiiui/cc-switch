@@ -22,7 +22,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import type { FailoverQueueItem } from "@/types/proxy";
-import type { ProxyAppId } from "@/config/appConfig";
+import type { FailoverAppId } from "@/config/appConfig";
 import {
   useFailoverQueue,
   useAvailableProvidersForFailover,
@@ -30,10 +30,11 @@ import {
   useRemoveFromFailoverQueue,
   useAutoFailoverEnabled,
   useSetAutoFailoverEnabled,
+  useFailoverPolicy,
 } from "@/lib/query/failover";
 
 interface FailoverQueueManagerProps {
-  appType: ProxyAppId;
+  appType: FailoverAppId;
   disabled?: boolean;
 }
 
@@ -46,7 +47,9 @@ export function FailoverQueueManager({
 
   // 故障转移开关状态（每个应用独立）
   const { data: isFailoverEnabled = false } = useAutoFailoverEnabled(appType);
+  const { data: failoverPolicy } = useFailoverPolicy(appType);
   const setFailoverEnabled = useSetAutoFailoverEnabled();
+  const isStickyRotation = failoverPolicy?.strategy === "stickyRotation";
 
   // 查询数据
   const {
@@ -139,10 +142,15 @@ export function FailoverQueueManager({
             )}
           </div>
           <p className="text-xs text-muted-foreground">
-            {t("proxy.failover.autoSwitchDescription", {
-              defaultValue:
-                "开启后将立即切换到队列 P1，并在请求失败时自动切换到队列中的下一个供应商",
-            })}
+            {isStickyRotation
+              ? t("proxy.failover.stickyAutoSwitchDescription", {
+                  defaultValue:
+                    "开启后保留当前供应商；失败时按环形顺序轮转，成功者成为新的当前供应商",
+                })
+              : t("proxy.failover.autoSwitchDescription", {
+                  defaultValue:
+                    "开启后将立即切换到队列 P1，并在请求失败时自动切换到队列中的下一个供应商",
+                })}
           </p>
         </div>
         <Switch
@@ -156,12 +164,29 @@ export function FailoverQueueManager({
       <Alert className="border-blue-500/40 bg-blue-500/10">
         <Info className="h-4 w-4" />
         <AlertDescription className="text-sm">
-          {t(
-            "proxy.failoverQueue.info",
-            "队列顺序与首页供应商列表顺序一致。当请求失败时，系统会按顺序依次尝试队列中的供应商。",
-          )}
+          {isStickyRotation
+            ? t(
+                "proxy.failoverQueue.stickyInfo",
+                "当前供应商是动态主供应商。失败后从它的下一位开始环形轮转，成功者成为新的当前供应商，恢复后不会自动切回队首。",
+              )
+            : t(
+                "proxy.failoverQueue.info",
+                "队列顺序与首页供应商列表顺序一致。当请求失败时，系统会按顺序依次尝试队列中的供应商。",
+              )}
         </AlertDescription>
       </Alert>
+
+      {appType === "claude-desktop" && (
+        <Alert className="border-amber-500/40 bg-amber-500/10">
+          <Info className="h-4 w-4" />
+          <AlertDescription className="text-sm">
+            {t(
+              "proxy.failoverQueue.claudeDesktopProxyOnly",
+              "Claude Desktop 仅支持在本地路由模式供应商之间自动故障转移；直连和官方供应商不会出现在可选列表中。",
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* 添加供应商 */}
       <div className="flex items-center gap-2">

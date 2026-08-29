@@ -2895,12 +2895,15 @@
     "failover": {
       "proxyRequired": "フェイルオーバーを設定するには、ルーティングサービスを先に起動する必要があります",
       "autoSwitch": "自動フェイルオーバー",
-      "autoSwitchDescription": "有効にするとキューの P1 に即時切り替え、リクエスト失敗時はキュー内の次のプロバイダーを自動で試行します"
+      "autoSwitchDescription": "有効にするとキューの P1 に即時切り替え、リクエスト失敗時はキュー内の次のプロバイダーを自動で試行します",
+      "stickyAutoSwitchDescription": "現在のプロバイダーを維持し、失敗時はリング順で切り替え、成功したプロバイダーを現在値にします"
     },
     "failoverQueue": {
       "title": "フェイルオーバーキュー",
       "description": "各アプリのプロバイダーのフェイルオーバー順序を管理します",
       "info": "自動フェイルオーバーを有効にすると、キューの優先度順（P1 優先）でプロバイダーを使用します。失敗時はキュー内の次のプロバイダーを順に試行します。",
+      "stickyInfo": "現在のプロバイダーが動的プライマリです。失敗時は次のプロバイダーからリング順に試し、成功したプロバイダーを現在値にします。回復してもキュー先頭へ自動では戻りません。",
+      "claudeDesktopProxyOnly": "Claude Desktop の自動フェイルオーバーはローカルルーティングモードのプロバイダー間でのみ利用できます。直接接続と公式プロバイダーは一覧に表示されません。",
       "selectProvider": "キューに追加するプロバイダーを選択",
       "noAvailableProviders": "追加できるプロバイダーがありません",
       "empty": "フェイルオーバーキューが空です。自動フェイルオーバーを有効にするにはプロバイダーを追加してください。",
@@ -2920,6 +2923,14 @@
       "configSaved": "自動フェイルオーバー設定を保存しました",
       "configSaveFailed": "保存に失敗しました",
       "validationFailed": "以下のフィールドが有効範囲外です: {{fields}}",
+      "strategy": "フェイルオーバー戦略",
+      "strategyPriority": "固定優先度",
+      "strategyPriorityHint": "有効化時にキュー P1 へ切り替え、その後も固定優先度順で試行します。",
+      "strategyStickyRotation": "現在優先ローテーション",
+      "strategyStickyRotationHint": "現在のプロバイダーを維持し、失敗時はリング順で切り替え、成功したプロバイダーを現在値にします。キュー先頭へは自動で戻りません。",
+      "rateLimitCooldown": "レート制限の既定クールダウン（秒）",
+      "maxRateLimitCooldown": "レート制限の最大クールダウン（秒）",
+      "cooldownOrderInvalid": "既定クールダウンは最大クールダウン以下にしてください",
       "retrySettings": "リトライとタイムアウト設定",
       "failureThreshold": "失敗しきい値",
       "failureThresholdHint": "この回数連続で失敗するとサーキットブレーカーが開きます（推奨: 3-10）",

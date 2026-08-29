@@ -88,7 +88,8 @@ impl FailoverSwitchManager {
             }
         };
 
-        if !app_enabled {
+        let is_claude_desktop = app_type == crate::app_config::AppType::ClaudeDesktop.as_str();
+        if !app_enabled && !is_claude_desktop {
             log::debug!("[Failover] {app_type} 未启用代理，跳过切换");
             return Ok(false);
         }
@@ -99,12 +100,25 @@ impl FailoverSwitchManager {
 
         if let Some(app) = app_handle {
             if let Some(app_state) = app.try_state::<crate::store::AppState>() {
-                switched = app_state
-                    .proxy_service
-                    .hot_switch_provider(app_type, provider_id)
-                    .await
-                    .map_err(AppError::Message)?
-                    .logical_target_changed;
+                switched = if is_claude_desktop {
+                    let previous = crate::settings::get_effective_current_provider(
+                        app_state.db.as_ref(),
+                        &crate::app_config::AppType::ClaudeDesktop,
+                    )?;
+                    crate::services::ProviderService::switch(
+                        app_state.inner(),
+                        crate::app_config::AppType::ClaudeDesktop,
+                        provider_id,
+                    )?;
+                    previous.as_deref() != Some(provider_id)
+                } else {
+                    app_state
+                        .proxy_service
+                        .hot_switch_provider(app_type, provider_id)
+                        .await
+                        .map_err(AppError::Message)?
+                        .logical_target_changed
+                };
 
                 if !switched {
                     return Ok(false);

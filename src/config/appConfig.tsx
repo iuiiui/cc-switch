@@ -68,6 +68,17 @@ export function isProxyAppId(appId: string): appId is ProxyAppId {
   return (PROXY_APP_IDS as string[]).includes(appId);
 }
 
+/** Apps whose requests can participate in the local gateway failover pipeline. */
+export type FailoverAppId = ProxyAppId | "claude-desktop";
+
+export const FAILOVER_APP_IDS: FailoverAppId[] = [
+  "claude",
+  "claude-desktop",
+  "codex",
+  "gemini",
+  "grokbuild",
+];
+
 export type AdditiveAppId = Extract<
   AppId,
   "opencode" | "openclaw" | "hermes" | "pi"
