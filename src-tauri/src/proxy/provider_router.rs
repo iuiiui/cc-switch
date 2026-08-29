@@ -209,6 +209,24 @@ impl ProviderRouter {
         }
     }
 
+    pub async fn earliest_rate_limit_retry_delay(
+        &self,
+        providers: &[Provider],
+        app_type: &str,
+    ) -> Option<Duration> {
+        let now = Instant::now();
+        let mut cooldowns = self.rate_limit_cooldowns.write().await;
+        cooldowns.retain(|_, until| *until > now);
+        providers
+            .iter()
+            .filter_map(|provider| {
+                cooldowns
+                    .get(&format!("{app_type}:{}", provider.id))
+                    .map(|until| until.saturating_duration_since(now))
+            })
+            .min()
+    }
+
     /// 清除指定应用的运行期熔断器与速率限制冷却。
     /// 健康状态属于当前代理进程，重新启用故障转移时不继承上一轮状态。
     pub async fn reset_app_runtime_state(&self, app_type: &str) {

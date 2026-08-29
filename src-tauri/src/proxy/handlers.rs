@@ -358,6 +358,7 @@ async fn write_claude_usage_log(state: &ProxyState, log: ClaudeUsageLog) {
         None,
         log.is_streaming,
         log.status_code,
+        None,
         Some(log.session_id),
     )
     .await;
@@ -472,8 +473,9 @@ async fn handle_claude_transform(
             Some(SseUsageCollector::new(
                 start_time,
                 Some(claude_stream_usage_event_filter),
-                move |events, first_token_ms| {
-                    if let Some(usage) = TokenUsage::from_claude_stream_events(&events) {
+                move |events, first_token_ms, terminal_outcome| {
+                    let usage = TokenUsage::from_claude_stream_events(&events).unwrap_or_default();
+                    if usage.has_billable_tokens() || terminal_outcome.error_message.is_some() {
                         let model = usage
                             .model
                             .clone()
@@ -485,6 +487,9 @@ async fn handle_claude_transform(
                         let session_id = session_id.clone();
                         let request_model = request_model.clone();
                         let outbound_model = fallback_model.clone();
+                        let final_status =
+                            terminal_outcome.status_code_override.unwrap_or(status_code);
+                        let final_error = terminal_outcome.error_message;
 
                         tokio::spawn(async move {
                             log_usage(
@@ -498,7 +503,8 @@ async fn handle_claude_transform(
                                 latency_ms,
                                 first_token_ms,
                                 true,
-                                status_code,
+                                final_status,
+                                final_error,
                                 Some(session_id),
                             )
                             .await;
@@ -1269,6 +1275,7 @@ async fn handle_codex_responses_namespace_restore(
                             None,
                             false,
                             status.as_u16(),
+                            None,
                             Some(session_id),
                         )
                         .await;
@@ -1343,7 +1350,7 @@ async fn handle_codex_chat_to_responses_transform(
             Some(SseUsageCollector::new(
                 start_time,
                 Some(codex_stream_usage_event_filter),
-                move |events, first_token_ms| {
+                move |events, first_token_ms, terminal_outcome| {
                     let usage =
                         TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
                     // 上游遵守 OpenAI 语义省略 usage 时，Chat→Responses 转换器会合成一个
@@ -1351,7 +1358,7 @@ async fn handle_codex_chat_to_responses_transform(
                     // 存在（哪怕=0）即返回 Some。缺 nonzero 闸门会让全 0 usage 也被写入：
                     // message_id=None → dedup_request_id 退化为随机 UUID，无法去重，每笔
                     // 请求插入一条无意义空行、虚增请求数。对齐 Claude transform handler 的 skip。
-                    if !usage.has_billable_tokens() {
+                    if !usage.has_billable_tokens() && terminal_outcome.error_message.is_none() {
                         log::debug!("[Codex] 流式响应 usage 全 0 或缺失，跳过消费记录");
                         return;
                     }
@@ -1367,6 +1374,10 @@ async fn handle_codex_chat_to_responses_transform(
                     let request_model = request_model.clone();
                     let outbound_model = fallback_model.clone();
                     let session_id = session_id.clone();
+                    let final_status = terminal_outcome
+                        .status_code_override
+                        .unwrap_or(status.as_u16());
+                    let final_error = terminal_outcome.error_message;
 
                     tokio::spawn(async move {
                         log_usage(
@@ -1380,7 +1391,8 @@ async fn handle_codex_chat_to_responses_transform(
                             latency_ms,
                             first_token_ms,
                             true,
-                            status.as_u16(),
+                            final_status,
+                            final_error,
                             Some(session_id),
                         )
                         .await;
@@ -1503,6 +1515,7 @@ async fn handle_codex_chat_to_responses_transform(
                     None,
                     false,
                     status.as_u16(),
+                    None,
                     Some(session_id),
                 )
                 .await;
@@ -1668,6 +1681,7 @@ async fn handle_codex_anthropic_to_responses_transform(
                     None,
                     false,
                     status.as_u16(),
+                    None,
                     Some(session_id),
                 )
                 .await;
@@ -1723,9 +1737,9 @@ fn build_codex_anthropic_sse_response(
         Some(SseUsageCollector::new(
             start_time,
             Some(codex_stream_usage_event_filter),
-            move |events, first_token_ms| {
+            move |events, first_token_ms, terminal_outcome| {
                 let usage = TokenUsage::from_codex_stream_events_auto(&events).unwrap_or_default();
-                if !usage.has_billable_tokens() {
+                if !usage.has_billable_tokens() && terminal_outcome.error_message.is_none() {
                     log::debug!("[Codex] Anthropic streaming response usage is all-zero or missing, skipping usage recording");
                     return;
                 }
@@ -1741,6 +1755,10 @@ fn build_codex_anthropic_sse_response(
                 let request_model = request_model.clone();
                 let outbound_model = fallback_model.clone();
                 let session_id = session_id.clone();
+                let final_status = terminal_outcome
+                    .status_code_override
+                    .unwrap_or(status.as_u16());
+                let final_error = terminal_outcome.error_message;
 
                 tokio::spawn(async move {
                     log_usage(
@@ -1754,7 +1772,8 @@ fn build_codex_anthropic_sse_response(
                         latency_ms,
                         first_token_ms,
                         true,
-                        status.as_u16(),
+                        final_status,
+                        final_error,
                         Some(session_id),
                     )
                     .await;
@@ -2792,6 +2811,7 @@ async fn log_usage(
     first_token_ms: Option<u64>,
     is_streaming: bool,
     status_code: u16,
+    error_message: Option<String>,
     session_id: Option<String>,
 ) {
     use super::usage::logger::UsageLogger;
@@ -2813,7 +2833,7 @@ async fn log_usage(
     let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
     let request_id = usage.dedup_request_id(dedup_scope);
 
-    if let Err(e) = logger.log_with_calculation(
+    if let Err(e) = logger.log_with_calculation_outcome(
         request_id,
         provider_id.to_string(),
         app_type.to_string(),
@@ -2825,6 +2845,7 @@ async fn log_usage(
         latency_ms,
         first_token_ms,
         status_code,
+        error_message,
         session_id,
         None, // provider_type
         is_streaming,

@@ -347,7 +347,14 @@ pub async fn process_response(
 // SSE 使用量收集器
 // ============================================================================
 
-type UsageCallbackWithTiming = Arc<dyn Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static>;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamTerminalOutcome {
+    pub status_code_override: Option<u16>,
+    pub error_message: Option<String>,
+}
+
+type UsageCallbackWithTiming =
+    Arc<dyn Fn(Vec<Value>, Option<u64>, StreamTerminalOutcome) + Send + Sync + 'static>;
 
 /// SSE 使用量收集器
 #[derive(Clone)]
@@ -359,6 +366,7 @@ struct SseUsageCollectorInner {
     events: Mutex<Vec<Value>>,
     first_event_time: Mutex<Option<std::time::Instant>>,
     first_event_set: AtomicBool,
+    terminal_outcome: Mutex<StreamTerminalOutcome>,
     start_time: std::time::Instant,
     on_complete: UsageCallbackWithTiming,
     should_collect: Option<StreamUsageEventFilter>,
@@ -370,7 +378,7 @@ impl SseUsageCollector {
     pub fn new(
         start_time: std::time::Instant,
         should_collect: Option<StreamUsageEventFilter>,
-        callback: impl Fn(Vec<Value>, Option<u64>) + Send + Sync + 'static,
+        callback: impl Fn(Vec<Value>, Option<u64>, StreamTerminalOutcome) + Send + Sync + 'static,
     ) -> Self {
         let on_complete: UsageCallbackWithTiming = Arc::new(callback);
         Self {
@@ -378,6 +386,7 @@ impl SseUsageCollector {
                 events: Mutex::new(Vec::new()),
                 first_event_time: Mutex::new(None),
                 first_event_set: AtomicBool::new(false),
+                terminal_outcome: Mutex::new(StreamTerminalOutcome::default()),
                 start_time,
                 on_complete,
                 should_collect,
@@ -412,6 +421,14 @@ impl SseUsageCollector {
         events.push(event);
     }
 
+    pub async fn set_terminal_failure(&self, status_code: u16, message: impl Into<String>) {
+        let mut outcome = self.inner.terminal_outcome.lock().await;
+        if outcome.error_message.is_none() {
+            outcome.status_code_override = Some(status_code);
+            outcome.error_message = Some(message.into());
+        }
+    }
+
     /// 完成收集并触发回调
     pub async fn finish(&self) {
         if self.inner.finished.swap(true, Ordering::SeqCst) {
@@ -428,7 +445,9 @@ impl SseUsageCollector {
             first_time.map(|t| (t - self.inner.start_time).as_millis() as u64)
         };
 
-        (self.inner.on_complete)(events, first_token_ms);
+        let terminal_outcome = self.inner.terminal_outcome.lock().await.clone();
+
+        (self.inner.on_complete)(events, first_token_ms, terminal_outcome);
     }
 }
 
@@ -504,7 +523,9 @@ pub(crate) fn create_usage_collector(
     Some(SseUsageCollector::new(
         start_time,
         parser_config.stream_event_filter,
-        move |events, first_token_ms| {
+        move |events, first_token_ms, terminal_outcome| {
+            let final_status = terminal_outcome.status_code_override.unwrap_or(status_code);
+            let final_error = terminal_outcome.error_message;
             if let Some(usage) = stream_parser(&events) {
                 let model = model_extractor(&events, &fallback_model);
                 let latency_ms = start_time.elapsed().as_millis() as u64;
@@ -527,7 +548,8 @@ pub(crate) fn create_usage_collector(
                         latency_ms,
                         first_token_ms,
                         true, // is_streaming
-                        status_code,
+                        final_status,
+                        final_error,
                         Some(session_id),
                     )
                     .await;
@@ -553,7 +575,8 @@ pub(crate) fn create_usage_collector(
                         latency_ms,
                         first_token_ms,
                         true, // is_streaming
-                        status_code,
+                        final_status,
+                        final_error,
                         Some(session_id),
                     )
                     .await;
@@ -607,6 +630,7 @@ fn spawn_log_usage(
             None,
             is_streaming,
             status_code,
+            None,
             Some(session_id),
         )
         .await;
@@ -640,6 +664,7 @@ async fn log_usage_internal(
     first_token_ms: Option<u64>,
     is_streaming: bool,
     status_code: u16,
+    error_message: Option<String>,
     session_id: Option<String>,
 ) {
     use super::usage::logger::UsageLogger;
@@ -665,7 +690,7 @@ async fn log_usage_internal(
         usage.cache_creation_tokens
     );
 
-    if let Err(e) = logger.log_with_calculation(
+    if let Err(e) = logger.log_with_calculation_outcome(
         request_id,
         provider_id.to_string(),
         app_type.to_string(),
@@ -677,6 +702,7 @@ async fn log_usage_internal(
         latency_ms,
         first_token_ms,
         status_code,
+        error_message,
         session_id,
         None, // provider_type
         is_streaming,
@@ -698,6 +724,8 @@ struct AnthropicTerminalState {
     saw_final_message_delta: bool,
     saw_message_stop: bool,
     saw_error: bool,
+    error_status: Option<u16>,
+    error_message: Option<String>,
     open_content_blocks: HashSet<u64>,
 }
 
@@ -746,9 +774,36 @@ fn observe_anthropic_sse_block(block: &str, state: &mut AnthropicTerminalState) 
                 .is_some_and(|reason| !reason.is_empty());
         }
         Some("message_stop") => state.saw_message_stop = true,
-        Some("error") => state.saw_error = true,
+        Some("error") => {
+            state.saw_error = true;
+            let error_type = parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/error/type"))
+                .and_then(Value::as_str)
+                .unwrap_or("stream_error");
+            state.error_status = Some(if error_type == "stream_timeout" {
+                504
+            } else {
+                502
+            });
+            state.error_message = Some(
+                parsed
+                    .as_ref()
+                    .and_then(|value| value.pointer("/error/message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Upstream stream returned an error event")
+                    .to_string(),
+            );
+        }
         _ => {}
     }
+}
+
+fn anthropic_can_complete_safely(state: &AnthropicTerminalState) -> bool {
+    state.saw_message_start
+        && state.saw_final_message_delta
+        && state.open_content_blocks.is_empty()
+        && !state.saw_error
 }
 
 fn anthropic_terminal_bytes(
@@ -759,10 +814,7 @@ fn anthropic_terminal_bytes(
     if state.saw_message_stop || state.saw_error {
         return None;
     }
-    if state.saw_message_start
-        && state.saw_final_message_delta
-        && state.open_content_blocks.is_empty()
-    {
+    if anthropic_can_complete_safely(state) {
         return Some(Bytes::from_static(
             b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         ));
@@ -826,6 +878,17 @@ pub fn create_logged_passthrough_stream(
                             // 超时
                             let timeout_type = if is_first_chunk { "首字节" } else { "静默期" };
                             log::error!("[{tag}] 流式响应{}超时 ({}秒)", timeout_type, duration.as_secs());
+                            if terminal_policy != SseTerminalPolicy::AnthropicMessages
+                                || !anthropic_can_complete_safely(&anthropic_state)
+                            {
+                                if let Some(c) = &collector {
+                                    c.set_terminal_failure(
+                                        504,
+                                        format!("Upstream stream was idle for {} seconds", duration.as_secs()),
+                                    )
+                                    .await;
+                                }
+                            }
                             if terminal_policy == SseTerminalPolicy::AnthropicMessages {
                                 if !buffer.trim().is_empty() {
                                     observe_anthropic_sse_block(&buffer, &mut anthropic_state);
@@ -897,6 +960,18 @@ pub fn create_logged_passthrough_stream(
                     }
 
                     yield Ok(bytes);
+                    if anthropic_state.saw_error {
+                        if let Some(c) = &collector {
+                            c.set_terminal_failure(
+                                anthropic_state.error_status.unwrap_or(502),
+                                anthropic_state
+                                    .error_message
+                                    .clone()
+                                    .unwrap_or_else(|| "Upstream stream returned an error event".to_string()),
+                            )
+                            .await;
+                        }
+                    }
                     if terminal_policy == SseTerminalPolicy::AnthropicMessages
                         && (anthropic_state.saw_message_stop || anthropic_state.saw_error)
                     {
@@ -905,6 +980,14 @@ pub fn create_logged_passthrough_stream(
                 }
                 Some(Err(e)) => {
                     log::error!("[{tag}] 流错误: {e}");
+                    if terminal_policy != SseTerminalPolicy::AnthropicMessages
+                        || !anthropic_can_complete_safely(&anthropic_state)
+                    {
+                        if let Some(c) = &collector {
+                            c.set_terminal_failure(502, format!("Upstream stream I/O error: {e}"))
+                                .await;
+                        }
+                    }
                     if terminal_policy == SseTerminalPolicy::AnthropicMessages {
                         if !buffer.trim().is_empty() {
                             observe_anthropic_sse_block(&buffer, &mut anthropic_state);
@@ -935,6 +1018,15 @@ pub fn create_logged_passthrough_stream(
                             "stream_truncated",
                             "Upstream stream ended before message_stop",
                         ) {
+                            if !anthropic_can_complete_safely(&anthropic_state) {
+                                if let Some(c) = &collector {
+                                    c.set_terminal_failure(
+                                        502,
+                                        "Upstream stream ended before message_stop",
+                                    )
+                                    .await;
+                                }
+                            }
                             yield Ok(terminal);
                         }
                     }
@@ -1085,13 +1177,19 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_clean_eof_without_terminal_emits_protocol_error() {
+        let outcome = Arc::new(std::sync::Mutex::new(None));
+        let outcome_for_callback = outcome.clone();
+        let collector =
+            SseUsageCollector::new(std::time::Instant::now(), None, move |_, _, terminal| {
+                *outcome_for_callback.lock().expect("outcome lock") = Some(terminal);
+            });
         let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
             b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
         ))]);
         let output = create_logged_passthrough_stream(
             source,
             "test",
-            None,
+            Some(collector),
             StreamingTimeoutConfig {
                 first_byte_timeout: 0,
                 idle_timeout: 0,
@@ -1113,6 +1211,16 @@ mod tests {
         assert!(text.contains("event: error"), "{text}");
         assert!(text.contains("stream_truncated"), "{text}");
         assert!(!text.contains("event: message_stop"), "{text}");
+        let terminal = outcome
+            .lock()
+            .expect("outcome lock")
+            .clone()
+            .expect("terminal outcome");
+        assert_eq!(terminal.status_code_override, Some(502));
+        assert_eq!(
+            terminal.error_message.as_deref(),
+            Some("Upstream stream ended before message_stop")
+        );
     }
 
     #[tokio::test]
@@ -1319,6 +1427,7 @@ mod tests {
             false,
             200,
             None,
+            None,
         )
         .await;
 
@@ -1388,6 +1497,7 @@ mod tests {
             None,
             false,
             200,
+            None,
             None,
         )
         .await;
@@ -1468,6 +1578,7 @@ mod tests {
             None,
             false,
             200,
+            None,
             None,
         )
         .await;

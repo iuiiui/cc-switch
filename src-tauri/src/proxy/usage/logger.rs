@@ -443,6 +443,7 @@ impl<'a> UsageLogger<'a> {
 
     /// 计算并记录请求
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn log_with_calculation(
         &self,
         request_id: String,
@@ -456,6 +457,44 @@ impl<'a> UsageLogger<'a> {
         latency_ms: u64,
         first_token_ms: Option<u64>,
         status_code: u16,
+        session_id: Option<String>,
+        provider_type: Option<String>,
+        is_streaming: bool,
+    ) -> Result<(), AppError> {
+        self.log_with_calculation_outcome(
+            request_id,
+            provider_id,
+            app_type,
+            model,
+            request_model,
+            pricing_model,
+            usage,
+            cost_multiplier,
+            latency_ms,
+            first_token_ms,
+            status_code,
+            None,
+            session_id,
+            provider_type,
+            is_streaming,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_with_calculation_outcome(
+        &self,
+        request_id: String,
+        provider_id: String,
+        app_type: String,
+        model: String,
+        request_model: String,
+        pricing_model: String,
+        usage: TokenUsage,
+        cost_multiplier: Decimal,
+        latency_ms: u64,
+        first_token_ms: Option<u64>,
+        status_code: u16,
+        error_message: Option<String>,
         session_id: Option<String>,
         provider_type: Option<String>,
         is_streaming: bool,
@@ -490,7 +529,7 @@ impl<'a> UsageLogger<'a> {
             latency_ms,
             first_token_ms,
             status_code,
-            error_message: None,
+            error_message,
             session_id,
             provider_type,
             is_streaming,
@@ -587,6 +626,40 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(request_model, "req-model");
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_terminal_failure_persists_final_status_and_error() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let logger = UsageLogger::new(&db);
+        logger.log_with_calculation_outcome(
+            "stream-failed".to_string(),
+            "provider-1".to_string(),
+            "claude-desktop".to_string(),
+            "deepseek-v4-flash".to_string(),
+            "claude-sonnet-5".to_string(),
+            "deepseek-v4-flash".to_string(),
+            TokenUsage::default(),
+            Decimal::from(1),
+            12_000,
+            Some(500),
+            502,
+            Some("Upstream stream ended before message_stop".to_string()),
+            Some("session-1".to_string()),
+            None,
+            true,
+        )?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let (status, error, streaming): (u16, String, bool) = conn.query_row(
+            "SELECT status_code, error_message, is_streaming FROM proxy_request_logs WHERE request_id = 'stream-failed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(status, 502);
+        assert_eq!(error, "Upstream stream ended before message_stop");
+        assert!(streaming);
         Ok(())
     }
 

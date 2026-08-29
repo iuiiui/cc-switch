@@ -16,6 +16,7 @@ use super::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
         AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
     },
+    sse::{append_utf8_safe, strip_sse_field, take_sse_block},
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
@@ -183,6 +184,7 @@ pub struct RequestForwarder {
     non_streaming_timeout: std::time::Duration,
     /// 流式请求响应头等待超时（秒）
     streaming_first_byte_timeout: std::time::Duration,
+    streaming_idle_timeout: std::time::Duration,
     /// 单个客户端请求最多尝试的 provider 数。
     ///
     /// 由 `AppProxyConfig.max_retries` (UI: "请求失败时的重试次数, 0-10") 派生：
@@ -251,7 +253,7 @@ impl RequestForwarder {
         session_id: String,
         session_client_provided: bool,
         streaming_first_byte_timeout: u64,
-        _streaming_idle_timeout: u64,
+        streaming_idle_timeout: u64,
         rectifier_config: RectifierConfig,
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
@@ -278,7 +280,84 @@ impl RequestForwarder {
             streaming_first_byte_timeout: std::time::Duration::from_secs(
                 streaming_first_byte_timeout,
             ),
+            streaming_idle_timeout: std::time::Duration::from_secs(streaming_idle_timeout),
             max_attempts,
+        }
+    }
+
+    async fn buffer_complete_anthropic_stream(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut stream = Box::pin(response.bytes_stream());
+        let mut body = Vec::new();
+        let mut sse_buffer = String::new();
+        let mut utf8_remainder = Vec::new();
+
+        loop {
+            let next = if self.streaming_idle_timeout.is_zero() {
+                stream.next().await
+            } else {
+                match tokio::time::timeout(self.streaming_idle_timeout, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        return Err(ProxyError::ForwardFailed(format!(
+                            "Upstream stream was idle for {} seconds before message_stop",
+                            self.streaming_idle_timeout.as_secs()
+                        )));
+                    }
+                }
+            };
+
+            let Some(chunk) = next else {
+                return Err(ProxyError::ForwardFailed(
+                    "Upstream stream ended before message_stop".to_string(),
+                ));
+            };
+            let chunk = chunk.map_err(|error| {
+                ProxyError::ForwardFailed(format!("Upstream stream I/O error: {error}"))
+            })?;
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
+                return Err(ProxyError::ResponseBodyTooLarge(
+                    body.len().saturating_add(chunk.len()),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+            append_utf8_safe(&mut sse_buffer, &mut utf8_remainder, &chunk);
+
+            while let Some(block) = take_sse_block(&mut sse_buffer) {
+                let named_event = block
+                    .lines()
+                    .find_map(|line| strip_sse_field(line, "event"))
+                    .map(str::trim);
+                let data = block
+                    .lines()
+                    .filter_map(|line| strip_sse_field(line, "data"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let parsed = serde_json::from_str::<Value>(&data).ok();
+                let event_type = parsed
+                    .as_ref()
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str)
+                    .or(named_event);
+                match event_type {
+                    Some("message_stop") => {
+                        return Ok(ProxyResponse::buffered(status, headers, Bytes::from(body)));
+                    }
+                    Some("error") => {
+                        let message = parsed
+                            .as_ref()
+                            .and_then(|value| value.pointer("/error/message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("Upstream stream returned an error event");
+                        return Err(ProxyError::ForwardFailed(message.to_string()));
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -488,8 +567,15 @@ impl RequestForwarder {
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
         let bypass_circuit_breaker = providers.len() == 1;
 
-        // 依次尝试每个供应商
-        for provider in providers.iter() {
+        // 由 CC Switch 在同一个客户端请求内完成有界轮询。第一轮依次尝试队列；
+        // max_retries 仍有剩余额度时可进入下一轮，而不是立即把错误交回 Claude
+        // 触发它自己的 10 次指数退避重试。
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        // cycle 只扩展到 max_attempts，因此是有界的；当重试额度大于队列长度时，
+        // 后续槽位形成第二轮 Provider 尝试。
+        for (schedule_index, provider) in
+            providers.iter().cycle().take(self.max_attempts).enumerate()
+        {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
             let mut rectifier_retried = false;
@@ -515,7 +601,44 @@ impl RequestForwarder {
                 .is_provider_rate_limited(&provider.id, app_type_str)
                 .await
             {
-                continue;
+                // 第一轮不等待，立即尝试队列下一家；进入第二轮后若所有候选仍在
+                // cooldown，则由 CC Switch 在当前请求内等待最近恢复时间。
+                if schedule_index < providers.len() {
+                    continue;
+                }
+                let Some(delay) = self
+                    .router
+                    .earliest_rate_limit_retry_delay(&providers, app_type_str)
+                    .await
+                else {
+                    continue;
+                };
+                let now = std::time::Instant::now();
+                if now >= retry_deadline || delay > retry_deadline.saturating_duration_since(now) {
+                    continue;
+                }
+                log::info!(
+                    "[{app_type_str}] CC Switch 等待限流冷却 {}ms 后继续内部轮询",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                if self
+                    .router
+                    .is_provider_rate_limited(&provider.id, app_type_str)
+                    .await
+                {
+                    continue;
+                }
+            } else if schedule_index >= providers.len() {
+                let retry_round = schedule_index / providers.len();
+                let backoff = std::time::Duration::from_millis(
+                    (retry_round as u64).saturating_mul(500).min(2_000),
+                );
+                let now = std::time::Instant::now();
+                if now < retry_deadline && backoff <= retry_deadline.saturating_duration_since(now)
+                {
+                    tokio::time::sleep(backoff).await;
+                }
             }
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
@@ -573,6 +696,44 @@ impl RequestForwarder {
                 .await
             {
                 Ok((response, claude_api_format, outbound_model)) => {
+                    let strict_desktop_stream = matches!(app_type, AppType::ClaudeDesktop)
+                        && self.max_attempts > 1
+                        && body.get("stream").and_then(Value::as_bool) == Some(true)
+                        && matches!(claude_api_format.as_deref(), None | Some("anthropic"));
+                    let response = if strict_desktop_stream {
+                        match self.buffer_complete_anthropic_stream(response).await {
+                            Ok(response) => response,
+                            Err(stream_error) => {
+                                let _ = self
+                                    .router
+                                    .record_result(
+                                        &provider.id,
+                                        app_type_str,
+                                        permit,
+                                        false,
+                                        Some(stream_error.to_string()),
+                                    )
+                                    .await;
+                                {
+                                    let mut status = self.status.write().await;
+                                    status.last_error = Some(format!(
+                                        "Provider {} 流不完整: {}",
+                                        provider.name, stream_error
+                                    ));
+                                }
+                                log::warn!(
+                                    "[{app_type_str}] [FWD-STREAM] Provider {} 流不完整，未向 Claude 提交并继续下一家: {}",
+                                    provider.name,
+                                    stream_error
+                                );
+                                last_error = Some(stream_error);
+                                last_provider = Some(provider.clone());
+                                continue;
+                            }
+                        }
+                    } else {
+                        response
+                    };
                     self.finish_success(provider, app_type_str, permit).await;
 
                     return Ok(ForwardResult {
@@ -3680,8 +3841,70 @@ mod tests {
             copilot_optimizer_config: CopilotOptimizerConfig::default(),
             non_streaming_timeout,
             streaming_first_byte_timeout,
+            streaming_idle_timeout: Duration::ZERO,
             max_attempts: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn strict_desktop_stream_accepts_only_message_stop_terminated_stream() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let complete = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let response = ProxyResponse::streamed(
+            StatusCode::OK,
+            headers,
+            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                complete.as_bytes(),
+            ))]),
+        );
+
+        let buffered = forwarder
+            .buffer_complete_anthropic_stream(response)
+            .await
+            .expect("complete stream");
+        assert_eq!(
+            buffered
+                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+                .await
+                .expect("buffered body"),
+            Bytes::from_static(complete.as_bytes())
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_desktop_stream_rejects_truncated_stream_before_client_commit() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let truncated = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let response = ProxyResponse::streamed(
+            StatusCode::OK,
+            headers,
+            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                truncated.as_bytes(),
+            ))]),
+        );
+
+        let error = match forwarder.buffer_complete_anthropic_stream(response).await {
+            Ok(_) => panic!("truncated stream must be retried internally"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("before message_stop"), "{error}");
     }
 
     #[test]

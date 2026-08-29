@@ -1016,10 +1016,10 @@ fn apply_provider_to_paths_inner(
             )
         }
         ClaudeDesktopMode::Proxy => {
-            // Claude Desktop 的网络重试由本地 Claude Code agent 的环境变量控制。
-            // 在用户级 settings.json 中将它关闭后，429/5xx 的供应商轮询只由
-            // CC Switch 当前这一条入站请求完成，避免客户端再并发放大一轮请求。
-            apply_local_agent_retry_settings(paths)?;
+            // settings.json 的 env 在 Claude agent 初始化后才加载，不能覆盖 agent
+            // 自身早期读取的网络重试参数。撤销旧版写入；真正的接管在代理内部通过
+            // 完整流验证和 Provider 重试完成。
+            restore_local_agent_retry_settings(paths)?;
             let base_url = proxy_gateway_base_url_from_db(db)?;
             let api_key = get_or_create_gateway_token(db)?;
             let routes = proxy_model_routes(provider)?;
@@ -1124,13 +1124,6 @@ fn local_agent_config_dirs(paths: &ClaudeDesktopPaths) -> Vec<PathBuf> {
     dirs
 }
 
-fn backup_entry(env: &serde_json::Map<String, Value>, key: &str) -> Value {
-    match env.get(key) {
-        Some(value) => json!({ "present": true, "value": value }),
-        None => json!({ "present": false }),
-    }
-}
-
 fn restore_backup_entry(
     env: &mut serde_json::Map<String, Value>,
     key: &str,
@@ -1147,42 +1140,6 @@ fn restore_backup_entry(
         }
     }
     env.remove(key);
-}
-
-fn apply_local_agent_retry_settings(paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
-    for dir in local_agent_config_dirs(paths) {
-        let settings_path = dir.join(LOCAL_AGENT_SETTINGS_FILE);
-        let backup_path = dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE);
-        let mut settings = read_json_or_empty(&settings_path)?;
-        let settings_object = settings.as_object_mut().ok_or_else(|| {
-            AppError::Config(format!(
-                "Claude local agent settings 不是 JSON 对象: {}",
-                settings_path.display()
-            ))
-        })?;
-        let env = settings_object.entry("env").or_insert_with(|| json!({}));
-        let env = env.as_object_mut().ok_or_else(|| {
-            AppError::Config(format!(
-                "Claude local agent settings.env 不是 JSON 对象: {}",
-                settings_path.display()
-            ))
-        })?;
-
-        if !backup_path.exists() {
-            let backup = json!({
-                "version": 1,
-                "settingsExisted": settings_path.exists(),
-                "maxRetries": backup_entry(env, CLAUDE_MAX_RETRIES_ENV),
-                "retryWatchdog": backup_entry(env, CLAUDE_RETRY_WATCHDOG_ENV),
-            });
-            write_json_file(&backup_path, &backup)?;
-        }
-
-        env.insert(CLAUDE_MAX_RETRIES_ENV.to_string(), json!("0"));
-        env.insert(CLAUDE_RETRY_WATCHDOG_ENV.to_string(), json!("false"));
-        write_json_file(&settings_path, &settings)?;
-    }
-    Ok(())
 }
 
 fn restore_local_agent_retry_settings(paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
@@ -1794,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_mode_takes_over_cli_network_retries_and_direct_mode_restores_them() {
+    fn proxy_mode_restores_legacy_cli_retry_env_override() {
         let temp = TempDir::new().expect("tempdir");
         let paths = test_paths(temp.path());
         let db = test_db();
@@ -1831,12 +1788,23 @@ mod tests {
             &agent_dir.join(LOCAL_AGENT_SETTINGS_FILE),
             &json!({
                 "env": {
-                    CLAUDE_MAX_RETRIES_ENV: "7",
+                    CLAUDE_MAX_RETRIES_ENV: "0",
+                    CLAUDE_RETRY_WATCHDOG_ENV: "false",
                     "UNRELATED": "keep"
                 }
             }),
         )
-        .expect("write original settings");
+        .expect("write legacy managed settings");
+        write_json_file(
+            &agent_dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE),
+            &json!({
+                "version": 1,
+                "settingsExisted": true,
+                "maxRetries": {"present": true, "value": "7"},
+                "retryWatchdog": {"present": false}
+            }),
+        )
+        .expect("write legacy retry backup");
 
         apply_provider_to_paths(&db, &proxy_provider("proxy"), &paths)
             .expect("apply proxy provider");
@@ -1847,25 +1815,16 @@ mod tests {
                 json!(true)
             );
         }
-        let managed: Value = read_json_file(&agent_dir.join(LOCAL_AGENT_SETTINGS_FILE))
-            .expect("read managed settings");
-        assert_eq!(managed["env"][CLAUDE_MAX_RETRIES_ENV], json!("0"));
-        assert_eq!(managed["env"][CLAUDE_RETRY_WATCHDOG_ENV], json!("false"));
-        assert_eq!(managed["env"]["UNRELATED"], json!("keep"));
-        assert!(agent_dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE).exists());
-        assert!(db
-            .get_setting(LEGACY_AUTO_FALLBACK_BACKUP_SETTING_KEY)
-            .expect("read legacy backup")
-            .is_none());
-
-        apply_provider_to_paths(&db, &direct_provider("direct"), &paths)
-            .expect("apply direct provider");
         let restored: Value = read_json_file(&agent_dir.join(LOCAL_AGENT_SETTINGS_FILE))
             .expect("read restored settings");
         assert_eq!(restored["env"][CLAUDE_MAX_RETRIES_ENV], json!("7"));
         assert!(restored["env"].get(CLAUDE_RETRY_WATCHDOG_ENV).is_none());
         assert_eq!(restored["env"]["UNRELATED"], json!("keep"));
         assert!(!agent_dir.join(LOCAL_AGENT_RETRY_BACKUP_FILE).exists());
+        assert!(db
+            .get_setting(LEGACY_AUTO_FALLBACK_BACKUP_SETTING_KEY)
+            .expect("read legacy backup")
+            .is_none());
     }
 
     #[test]

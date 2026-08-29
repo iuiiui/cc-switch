@@ -969,8 +969,8 @@ impl ProxyService {
         }
 
         // 新版本首次启动本地路由时重新投影当前 Claude Desktop proxy profile，
-        // 并把本地 Claude Code agent 的网络重试设为 0。供应商轮询因此只由
-        // CC Switch 当前入站请求完成；Direct/Official 模式会恢复用户原值。
+        // 同时撤销旧版无效的 settings.json 重试变量。供应商轮询由代理内部的
+        // 完整流验证和 Provider 重试负责。
         if let Ok(Some(current_id)) = crate::settings::get_effective_current_provider(
             self.db.as_ref(),
             &AppType::ClaudeDesktop,
