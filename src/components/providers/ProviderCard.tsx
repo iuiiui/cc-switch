@@ -237,6 +237,8 @@ export function ProviderCard({
     appId,
     isFailoverAppId(appId),
   );
+  const isFailoverProviderUnavailable =
+    isInFailoverQueue && health?.is_healthy === false;
 
   const fallbackUrlText = t("provider.notConfigured", {
     defaultValue: "未配置接口地址",
@@ -354,7 +356,7 @@ export function ProviderCard({
       : appId === "opencode" || appId === "pi"
         ? false
         : isAutoFailoverEnabled
-          ? activeProviderId === provider.id
+          ? activeProviderId === provider.id && !isFailoverProviderUnavailable
           : isCurrent;
 
   const shouldUseGreen = !isAnyOmo && isProxyTakeover && isActiveProvider;

@@ -235,6 +235,12 @@ impl CircuitBreaker {
             self.release_half_open_permit();
         }
 
+        // Open 之后才返回的同批在途请求只完成日志链路，不再污染熔断统计。
+        // 它们在 Open 之前已经发往上游，无法撤回，但也不应继续累加失败数。
+        if state == CircuitState::Open {
+            return;
+        }
+
         // 更新计数器
         let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
         self.total_requests.fetch_add(1, Ordering::SeqCst);
@@ -422,6 +428,26 @@ mod tests {
         // 应该转换到打开状态
         assert_eq!(breaker.get_state().await, CircuitState::Open);
         assert!(!breaker.allow_request().await.allowed);
+    }
+
+    #[tokio::test]
+    async fn open_circuit_ignores_late_inflight_failures() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        });
+
+        breaker.record_failure(false).await;
+        assert_eq!(breaker.get_state().await, CircuitState::Open);
+        let before = breaker.get_stats().await;
+
+        for _ in 0..20 {
+            breaker.record_failure(false).await;
+        }
+
+        let after = breaker.get_stats().await;
+        assert_eq!(after.failed_requests, before.failed_requests);
+        assert_eq!(after.consecutive_failures, before.consecutive_failures);
     }
 
     #[tokio::test]

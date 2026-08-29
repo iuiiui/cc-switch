@@ -335,9 +335,16 @@ pub async fn get_provider_health(
 ) -> Result<ProviderHealth, String> {
     require_failover_app(&app_type)?;
     let db = &state.db;
-    db.get_provider_health(&provider_id, &app_type)
+    let mut health = db
+        .get_provider_health(&provider_id, &app_type)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Ok(config) = db.get_proxy_config_for_app(&app_type).await {
+        health.consecutive_failures = health
+            .consecutive_failures
+            .min(config.circuit_failure_threshold.max(1));
+    }
+    Ok(health)
 }
 
 /// 重置熔断器

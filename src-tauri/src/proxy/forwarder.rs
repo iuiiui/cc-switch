@@ -479,6 +479,17 @@ impl RequestForwarder {
                 break;
             }
 
+            // 候选列表是在请求开始时生成的；其它并发请求可能在此期间刚收到
+            // 429 并把该供应商放入冷却。真正发送前再检查一次，避免继续向已
+            // 明确限流的供应商发出尚未出站的请求。
+            if self
+                .router
+                .is_provider_rate_limited(&provider.id, app_type_str)
+                .await
+            {
+                continue;
+            }
+
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
             // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
             let (allowed, used_half_open_permit) = if bypass_circuit_breaker {

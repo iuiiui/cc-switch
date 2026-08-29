@@ -681,10 +681,12 @@ impl Database {
             // 成功：重置失败计数
             (1, 0)
         } else {
-            // 失败：增加失败计数
-            let failures = current.unwrap_or(0) + 1;
+            // 失败：展示用连续失败数钳制在阈值。熔断打开前已经在途的并发
+            // 请求仍会陆续返回，不能让一次并发尖峰把“阈值 10”显示成 21/60。
+            let threshold = failure_threshold.max(1);
+            let failures = (current.unwrap_or(0) + 1).min(threshold);
             // 使用传入的阈值而非硬编码
-            let healthy = if failures >= failure_threshold { 0 } else { 1 };
+            let healthy = if failures >= threshold { 0 } else { 1 };
             (healthy, failures)
         };
 
@@ -971,6 +973,8 @@ impl Database {
 mod tests {
     use crate::database::Database;
     use crate::error::AppError;
+    use crate::provider::Provider;
+    use serde_json::json;
 
     #[tokio::test]
     async fn claude_desktop_failover_config_round_trips_without_proxy_schema_row(
@@ -988,6 +992,37 @@ mod tests {
         let persisted = db.get_proxy_config_for_app("claude-desktop").await?;
         assert!(persisted.auto_failover_enabled);
         assert_eq!(persisted.max_retries, 5);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_health_failure_count_is_clamped_at_threshold() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let provider = Provider::with_id(
+            "burst-provider".to_string(),
+            "Burst Provider".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("claude-desktop", &provider)?;
+
+        for _ in 0..20 {
+            db.update_provider_health_with_threshold(
+                "burst-provider",
+                "claude-desktop",
+                false,
+                Some("HTTP 429".to_string()),
+                3,
+            )
+            .await?;
+        }
+
+        let health = db
+            .get_provider_health("burst-provider", "claude-desktop")
+            .await?;
+        assert_eq!(health.consecutive_failures, 3);
+        assert!(!health.is_healthy);
 
         Ok(())
     }

@@ -28,7 +28,13 @@ impl Database {
                 "SELECT id, name, sort_index, notes
                  FROM providers
                  WHERE app_type = ?1 AND in_failover_queue = 1
-                 ORDER BY COALESCE(sort_index, 999999), id ASC",
+                 ORDER BY
+                    CASE WHEN sort_index IS NULL THEN 1 ELSE 0 END,
+                    sort_index ASC,
+                    CASE WHEN created_at IS NULL OR created_at = 0 THEN 1 ELSE 0 END,
+                    created_at ASC,
+                    name COLLATE NOCASE ASC,
+                    id ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -145,5 +151,39 @@ impl Database {
             .collect();
 
         Ok(available)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::database::Database;
+    use crate::provider::Provider;
+    use serde_json::json;
+
+    #[test]
+    fn null_sort_indices_follow_visible_created_order() {
+        let db = Database::memory().expect("memory db");
+        for (id, name, created_at) in [
+            ("p2", "b.ai-2", 10),
+            ("p1", "b.ai-1", 20),
+            ("p3", "b.ai-3", 30),
+        ] {
+            let mut provider = Provider::with_id(id.to_string(), name.to_string(), json!({}), None);
+            provider.created_at = Some(created_at);
+            provider.sort_index = None;
+            db.save_provider("claude-desktop", &provider)
+                .expect("save provider");
+            db.add_to_failover_queue("claude-desktop", id)
+                .expect("add to queue");
+        }
+
+        let queue = db.get_failover_queue("claude-desktop").expect("get queue");
+        assert_eq!(
+            queue
+                .iter()
+                .map(|item| item.provider_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b.ai-2", "b.ai-1", "b.ai-3"]
+        );
     }
 }
