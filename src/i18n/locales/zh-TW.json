@@ -2781,7 +2781,10 @@
     "tooltip": {
       "enabled": "{{app}} 故障轉移已啟用\n按佇列優先順序（P1→P2→...）選擇供應商",
       "disabled": "啟用 {{app}} 故障轉移\n將立即切換至佇列 P1，並在失敗時自動切換至下一個",
-      "takeoverRequired": "請先接管 {{app}}，再啟用故障轉移"
+      "stickyEnabled": "{{app}} 目前優先輪轉已啟用\n目前供應商為動態 P1，失敗後環形輪轉",
+      "stickyDisabled": "啟用 {{app}} 目前優先輪轉\n保留目前供應商，失敗後環形切換",
+      "takeoverRequired": "請先接管 {{app}}，再啟用故障轉移",
+      "routingRequired": "請先啟動本機路由服務，再啟用 {{app}} 故障轉移"
     }
   },
   "proxy": {

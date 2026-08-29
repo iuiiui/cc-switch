@@ -8,47 +8,68 @@ import { Shuffle, Loader2 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import {
   useAutoFailoverEnabled,
+  useFailoverPolicy,
   useSetAutoFailoverEnabled,
 } from "@/lib/query/failover";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "react-i18next";
-import { getAppLabel, type ProxyAppId } from "@/config/appConfig";
+import { getAppLabel, type FailoverAppId } from "@/config/appConfig";
 
 interface FailoverToggleProps {
   className?: string;
-  activeApp: ProxyAppId;
+  activeApp: FailoverAppId;
 }
 
 export function FailoverToggle({ className, activeApp }: FailoverToggleProps) {
   const { t } = useTranslation();
   const { data: isEnabled = false, isLoading } =
     useAutoFailoverEnabled(activeApp);
+  const { data: policy } = useFailoverPolicy(activeApp);
   const setEnabled = useSetAutoFailoverEnabled();
-  const { takeoverStatus } = useProxyStatus();
-  const takeoverEnabled = takeoverStatus?.[activeApp] ?? false;
+  const { takeoverStatus, isRunning } = useProxyStatus();
+  const routingReady =
+    activeApp === "claude-desktop"
+      ? isRunning
+      : (takeoverStatus?.[activeApp] ?? false);
+  const isStickyRotation = policy?.strategy === "stickyRotation";
 
   const handleToggle = (checked: boolean) => {
-    if (checked && !takeoverEnabled) return;
+    if (checked && !routingReady) return;
     setEnabled.mutate({ appType: activeApp, enabled: checked });
   };
 
   const appLabel = getAppLabel(activeApp);
 
-  const tooltipText = !takeoverEnabled
-    ? t("failover.tooltip.takeoverRequired", {
-        app: appLabel,
-        defaultValue: `请先接管 ${appLabel}，再启用故障转移`,
-      })
-    : isEnabled
-      ? t("failover.tooltip.enabled", {
+  const tooltipText = !routingReady
+    ? activeApp === "claude-desktop"
+      ? t("failover.tooltip.routingRequired", {
           app: appLabel,
-          defaultValue: `${appLabel} 故障转移已启用\n按队列优先级（P1→P2→...）选择供应商`,
+          defaultValue: `请先启动本地路由服务，再启用 ${appLabel} 故障转移`,
         })
-      : t("failover.tooltip.disabled", {
+      : t("failover.tooltip.takeoverRequired", {
           app: appLabel,
-          defaultValue: `启用 ${appLabel} 故障转移\n将立即切换到队列 P1，并在失败时自动切换到下一个`,
-        });
+          defaultValue: `请先接管 ${appLabel}，再启用故障转移`,
+        })
+    : isEnabled
+      ? isStickyRotation
+        ? t("failover.tooltip.stickyEnabled", {
+            app: appLabel,
+            defaultValue: `${appLabel} 当前优先轮转已启用\n当前供应商为动态 P1，失败后环形轮转`,
+          })
+        : t("failover.tooltip.enabled", {
+            app: appLabel,
+            defaultValue: `${appLabel} 故障转移已启用\n按队列优先级（P1→P2→...）选择供应商`,
+          })
+      : isStickyRotation
+        ? t("failover.tooltip.stickyDisabled", {
+            app: appLabel,
+            defaultValue: `启用 ${appLabel} 当前优先轮转\n保留当前供应商，失败后环形切换`,
+          })
+        : t("failover.tooltip.disabled", {
+            app: appLabel,
+            defaultValue: `启用 ${appLabel} 故障转移\n将立即切换到队列 P1，并在失败时自动切换到下一个`,
+          });
 
   return (
     <div
@@ -73,7 +94,7 @@ export function FailoverToggle({ className, activeApp }: FailoverToggleProps) {
       <Switch
         checked={isEnabled}
         onCheckedChange={handleToggle}
-        disabled={setEnabled.isPending || isLoading || !takeoverEnabled}
+        disabled={setEnabled.isPending || isLoading || !routingReady}
       />
     </div>
   );

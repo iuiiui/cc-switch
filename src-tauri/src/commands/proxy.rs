@@ -17,6 +17,15 @@ fn require_proxy_app(app_type: &str) -> Result<crate::app_config::AppType, Strin
     Ok(app)
 }
 
+fn require_failover_app(app_type: &str) -> Result<crate::app_config::AppType, String> {
+    let app = crate::app_config::AppType::from_str(app_type)
+        .map_err(|error| format!("无效的应用类型: {error}"))?;
+    if !app.supports_local_proxy() && !matches!(app, crate::app_config::AppType::ClaudeDesktop) {
+        return Err(format!("{} 不支持故障转移", app.as_str()));
+    }
+    Ok(app)
+}
+
 /// 启动代理服务器（仅启动服务，不接管 Live 配置）
 #[tauri::command]
 pub async fn start_proxy_server(
@@ -129,7 +138,7 @@ pub async fn get_proxy_config_for_app(
     state: tauri::State<'_, AppState>,
     app_type: String,
 ) -> Result<AppProxyConfig, String> {
-    require_proxy_app(&app_type)?;
+    require_failover_app(&app_type)?;
     let db = &state.db;
     db.get_proxy_config_for_app(&app_type)
         .await
@@ -146,7 +155,7 @@ pub async fn update_proxy_config_for_app(
 ) -> Result<(), String> {
     let db = &state.db;
     let app_type = config.app_type.clone();
-    require_proxy_app(&app_type)?;
+    require_failover_app(&app_type)?;
     let circuit_config = CircuitBreakerConfig::from(&config);
 
     db.update_proxy_config_for_app(config)
@@ -324,7 +333,7 @@ pub async fn get_provider_health(
     provider_id: String,
     app_type: String,
 ) -> Result<ProviderHealth, String> {
-    require_proxy_app(&app_type)?;
+    require_failover_app(&app_type)?;
     let db = &state.db;
     db.get_provider_health(&provider_id, &app_type)
         .await
@@ -333,7 +342,7 @@ pub async fn get_provider_health(
 
 /// 重置熔断器
 ///
-/// 重置后会检查是否应该切回队列中优先级更高的供应商：
+/// 固定优先级策略下，重置后会检查是否应该切回队列中优先级更高的供应商：
 /// 1. 检查自动故障转移是否开启
 /// 2. 如果恢复的供应商在队列中优先级更高（queue_order 更小），则自动切换
 #[tauri::command]
@@ -343,7 +352,7 @@ pub async fn reset_circuit_breaker(
     provider_id: String,
     app_type: String,
 ) -> Result<(), String> {
-    require_proxy_app(&app_type)?;
+    let failover_app = require_failover_app(&app_type)?;
     // 1. 重置数据库健康状态
     let db = &state.db;
     db.update_provider_health(&provider_id, &app_type, true, None)
@@ -356,8 +365,8 @@ pub async fn reset_circuit_breaker(
         .reset_provider_circuit_breaker(&provider_id, &app_type)
         .await?;
 
-    // 3. 检查是否应该切回优先级更高的供应商（从 proxy_config 表读取）
-    // 只有当该应用已被代理接管（enabled=true）且开启了自动故障转移时才执行
+    // 3. 固定优先级策略才允许恢复后切回更高优先级供应商。
+    // 当前优先轮转只解除熔断，绝不主动改变动态 P1。
     let (app_enabled, auto_failover_enabled) = match db.get_proxy_config_for_app(&app_type).await {
         Ok(config) => (config.enabled, config.auto_failover_enabled),
         Err(e) => {
@@ -366,7 +375,18 @@ pub async fn reset_circuit_breaker(
         }
     };
 
-    if app_enabled && auto_failover_enabled && state.proxy_service.is_running().await {
+    let policy = db.get_failover_policy(&app_type).unwrap_or_default();
+    let fixed_priority = matches!(
+        policy.strategy,
+        crate::proxy::types::FailoverStrategy::Priority
+    );
+    let routing_ready = if matches!(failover_app, crate::app_config::AppType::ClaudeDesktop) {
+        state.proxy_service.is_running().await
+    } else {
+        app_enabled && state.proxy_service.is_running().await
+    };
+
+    if fixed_priority && routing_ready && auto_failover_enabled {
         // 获取当前供应商 ID
         let current_id = db
             .get_current_provider(&app_type)
@@ -460,9 +480,21 @@ pub async fn get_circuit_breaker_stats(
     provider_id: String,
     app_type: String,
 ) -> Result<Option<CircuitBreakerStats>, String> {
-    require_proxy_app(&app_type)?;
+    require_failover_app(&app_type)?;
     // 这个功能需要访问运行中的代理服务器的内存状态
     // 目前先返回 None，后续可以通过 ProxyService 暴露接口来实现
     let _ = (state, provider_id, app_type);
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{require_failover_app, require_proxy_app};
+
+    #[test]
+    fn claude_desktop_has_failover_without_generic_takeover() {
+        assert!(require_failover_app("claude-desktop").is_ok());
+        assert!(require_proxy_app("claude-desktop").is_err());
+        assert!(require_failover_app("pi").is_err());
+    }
 }

@@ -40,7 +40,7 @@ import { useProviderHealth } from "@/lib/query/failover";
 import { useUsageQuery } from "@/lib/query/queries";
 import { resolveProviderIcon } from "@/utils/providerIcon";
 import { ProviderStatusBadge } from "@/components/providers/ProviderStatusBadge";
-import { isAdditiveAppId, isProxyAppId } from "@/config/appConfig";
+import { isAdditiveAppId, isFailoverAppId } from "@/config/appConfig";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -235,7 +235,7 @@ export function ProviderCard({
   const { data: health } = useProviderHealth(
     provider.id,
     appId,
-    isProxyAppId(appId),
+    isFailoverAppId(appId),
   );
 
   const fallbackUrlText = t("provider.notConfigured", {

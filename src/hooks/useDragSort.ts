@@ -12,7 +12,7 @@ import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import type { Provider } from "@/types";
 import { providersApi, type AppId } from "@/lib/api";
-import { isProxyAppId } from "@/config/appConfig";
+import { isFailoverAppId } from "@/config/appConfig";
 
 export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
   const queryClient = useQueryClient();
@@ -82,7 +82,7 @@ export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
         });
 
         // Routing apps derive failover order from sort_index.
-        if (isProxyAppId(appId)) {
+        if (isFailoverAppId(appId)) {
           await queryClient.invalidateQueries({
             queryKey: ["failoverQueue", appId],
           });

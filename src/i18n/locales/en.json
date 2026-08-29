@@ -2780,7 +2780,10 @@
     "tooltip": {
       "enabled": "{{app}} failover enabled\nRequests follow queue priority (P1→P2→...)",
       "disabled": "Enable {{app}} failover\nSwitches to queue P1 immediately, then falls back on failures",
-      "takeoverRequired": "Take over {{app}} first, then enable failover"
+      "stickyEnabled": "{{app}} current-first rotation enabled\nThe current provider is dynamic P1; failures rotate through the ring",
+      "stickyDisabled": "Enable {{app}} current-first rotation\nKeep the current provider and rotate after failures",
+      "takeoverRequired": "Take over {{app}} first, then enable failover",
+      "routingRequired": "Start the local routing service before enabling {{app}} failover"
     }
   },
   "proxy": {

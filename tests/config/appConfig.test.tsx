@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAdditiveAppId } from "@/config/appConfig";
+import { isAdditiveAppId, isFailoverAppId } from "@/config/appConfig";
 
 describe("appConfig provider lifecycle", () => {
   it.each(["opencode", "openclaw", "hermes", "pi"])(
@@ -13,6 +13,13 @@ describe("appConfig provider lifecycle", () => {
     "does not classify %s as additive",
     (appId) => {
       expect(isAdditiveAppId(appId)).toBe(false);
+    },
+  );
+
+  it.each(["claude", "claude-desktop", "codex", "gemini", "grokbuild"])(
+    "classifies %s as failover-capable",
+    (appId) => {
+      expect(isFailoverAppId(appId)).toBe(true);
     },
   );
 });

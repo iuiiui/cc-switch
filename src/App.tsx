@@ -110,6 +110,7 @@ import HermesMemoryPanel from "@/components/hermes/HermesMemoryPanel";
 import {
   APP_IDS,
   DEFAULT_VISIBLE_APPS,
+  isFailoverAppId,
   isProxyAppId,
 } from "@/config/appConfig";
 
@@ -278,18 +279,19 @@ function App() {
     status: proxyStatus,
   } = useProxyStatus();
   const proxyAppId = isProxyAppId(activeApp) ? activeApp : null;
+  const failoverAppId = isFailoverAppId(activeApp) ? activeApp : null;
   const currentAppUsesProxy =
     proxyAppId !== null || activeApp === "claude-desktop";
   const isCurrentAppTakeoverActive = proxyAppId
     ? takeoverStatus?.[proxyAppId] || false
     : false;
   const activeProviderId = useMemo(() => {
-    if (!proxyAppId) return undefined;
+    if (!failoverAppId) return undefined;
     const target = proxyStatus?.active_targets?.find(
-      (t) => t.app_type === proxyAppId,
+      (t) => t.app_type === failoverAppId,
     );
     return target?.provider_id;
-  }, [proxyStatus?.active_targets, proxyAppId]);
+  }, [proxyStatus?.active_targets, failoverAppId]);
 
   const { data, isLoading, refetch } = useProvidersQuery(activeApp, {
     isProxyRunning: currentAppUsesProxy && isProxyRunning,
@@ -1374,18 +1376,15 @@ function App() {
                   className="flex shrink-0 items-center gap-1.5"
                   style={{ WebkitAppRegion: "no-drag" } as any}
                 >
-                  {activeApp === "claude-desktop" ? (
+                  {activeApp === "claude-desktop" && (
                     <ClaudeDesktopRouteToggle />
-                  ) : proxyAppId ? (
-                    <>
-                      {settingsData?.enableLocalProxy && (
-                        <ProxyToggle activeApp={proxyAppId} />
-                      )}
-                      {settingsData?.enableFailoverToggle && (
-                        <FailoverToggle activeApp={proxyAppId} />
-                      )}
-                    </>
-                  ) : null}
+                  )}
+                  {proxyAppId && settingsData?.enableLocalProxy && (
+                    <ProxyToggle activeApp={proxyAppId} />
+                  )}
+                  {failoverAppId && settingsData?.enableFailoverToggle && (
+                    <FailoverToggle activeApp={failoverAppId} />
+                  )}
                 </div>
               )}
             {currentView === "providers" &&

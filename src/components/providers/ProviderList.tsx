@@ -35,6 +35,7 @@ import { ProviderCard } from "@/components/providers/ProviderCard";
 import { ProviderEmptyState } from "@/components/providers/ProviderEmptyState";
 import {
   useAutoFailoverEnabled,
+  useFailoverPolicy,
   useFailoverQueue,
   useAddToFailoverQueue,
   useRemoveFromFailoverQueue,
@@ -48,7 +49,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { usePiCurrentState } from "@/lib/query/pi";
-import { isProxyAppId } from "@/config/appConfig";
+import { isFailoverAppId } from "@/config/appConfig";
 
 interface ProviderListProps {
   providers: Record<string, Provider>;
@@ -150,18 +151,23 @@ export function ProviderList({
 
   // Only apps with an explicit local-routing capability participate in
   // failover. Additive apps such as Pi never query or render this state.
-  const supportsFailover = isProxyAppId(appId);
+  const supportsFailover = isFailoverAppId(appId);
   const { data: isAutoFailoverEnabled } = useAutoFailoverEnabled(
     appId,
     supportsFailover,
   );
   const { data: failoverQueue } = useFailoverQueue(appId, supportsFailover);
+  const { data: failoverPolicy } = useFailoverPolicy(
+    supportsFailover ? appId : "",
+  );
   const addToQueue = useAddToFailoverQueue();
   const removeFromQueue = useRemoveFromFailoverQueue();
 
   const isFailoverModeActive =
     supportsFailover &&
-    isProxyTakeover === true &&
+    (appId === "claude-desktop"
+      ? isProxyRunning === true
+      : isProxyTakeover === true) &&
     isAutoFailoverEnabled === true;
 
   const isOpenCode = appId === "opencode";
@@ -174,9 +180,24 @@ export function ProviderList({
       const index = failoverQueue.findIndex(
         (item) => item.providerId === providerId,
       );
-      return index >= 0 ? index + 1 : undefined;
+      if (index < 0) return undefined;
+      if (failoverPolicy?.strategy !== "stickyRotation") return index + 1;
+
+      const currentIndex = failoverQueue.findIndex(
+        (item) => item.providerId === currentProviderId,
+      );
+      if (currentIndex < 0) return index + 1;
+      return (
+        ((index - currentIndex + failoverQueue.length) % failoverQueue.length) +
+        1
+      );
     },
-    [isFailoverModeActive, failoverQueue],
+    [
+      currentProviderId,
+      failoverPolicy?.strategy,
+      failoverQueue,
+      isFailoverModeActive,
+    ],
   );
 
   const isInFailoverQueue = useCallback(
@@ -489,7 +510,11 @@ export function ProviderList({
                     : undefined
                 }
                 activeProviderId={
-                  supportsFailover ? activeProviderId : undefined
+                  supportsFailover
+                    ? appId === "claude-desktop"
+                      ? activeProviderId || currentProviderId
+                      : activeProviderId
+                    : undefined
                 }
                 isDefaultModel={
                   appId === "hermes"

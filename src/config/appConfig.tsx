@@ -79,6 +79,10 @@ export const FAILOVER_APP_IDS: FailoverAppId[] = [
   "grokbuild",
 ];
 
+export function isFailoverAppId(appId: string): appId is FailoverAppId {
+  return (FAILOVER_APP_IDS as string[]).includes(appId);
+}
+
 export type AdditiveAppId = Extract<
   AppId,
   "opencode" | "openclaw" | "hermes" | "pi"
