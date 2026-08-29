@@ -56,6 +56,13 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<(), AppError> {
+        let conn = lock_conn!(self.conn);
+        conn.execute("DELETE FROM settings WHERE key = ?1", params![key])
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     // --- 通用配置片段 (Common Config Snippet) ---
 
     /// 获取通用配置片段

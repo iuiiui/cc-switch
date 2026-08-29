@@ -42,6 +42,10 @@ export function useProxyStatus() {
         { closeButton: true },
       );
       queryClient.invalidateQueries({ queryKey: proxyKeys.status });
+      // 新代理运行期会清空后端健康/熔断状态；同步丢弃上一运行期的前端缓存，
+      // 避免启动后短暂显示旧的红色“熔断”徽章。
+      queryClient.removeQueries({ queryKey: ["providerHealth"] });
+      queryClient.removeQueries({ queryKey: ["circuitBreakerStats"] });
     },
     onError: (error: Error) => {
       const detail =

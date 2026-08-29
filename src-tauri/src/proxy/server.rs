@@ -411,6 +411,13 @@ impl ProxyServer {
             .reset_provider_breaker(provider_id, app_type)
             .await;
     }
+
+    pub async fn reset_app_failover_state(&self, app_type: &str) {
+        self.state
+            .provider_router
+            .reset_app_runtime_state(app_type)
+            .await;
+    }
 }
 
 #[cfg(test)]

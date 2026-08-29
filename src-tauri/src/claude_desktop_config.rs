@@ -19,6 +19,8 @@ const CONFIG_FILE: &str = "claude_desktop_config.json";
 #[cfg(any(target_os = "macos", windows, test))]
 const CONFIG_LIBRARY_DIR: &str = "configLibrary";
 const GATEWAY_TOKEN_SETTING_KEY: &str = "claude_desktop_gateway_token";
+const AUTO_FALLBACK_BACKUP_SETTING_KEY: &str = "claude_desktop_cowork_auto_fallback_backup_v1";
+const AUTO_FALLBACK_PREFERENCE_KEY: &str = "coworkModelAutoFallbackByAccount";
 const CLAUDE_DESKTOP_PROXY_PREFIX: &str = "/claude-desktop";
 const DEFAULT_CREATED_AT: &str = "2024-01-01T00:00:00Z";
 const MIMO_REDACTED_THINKING_PLACEHOLDER: &str = "[redacted thinking]";
@@ -747,6 +749,16 @@ pub fn map_proxy_request_model(mut body: Value, provider: &Provider) -> Result<V
         })?;
 
     body["model"] = json!(upstream_model);
+    if body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .is_some_and(|max_tokens| max_tokens <= 2)
+    {
+        // Claude Desktop 会发送 max_tokens=1/2 的内部轮询请求；部分兼容
+        // 端点（实测 b.ai）要求 >2。仅在 Desktop 本地网关把下限提升到 3，
+        // 避免 400 触发 Claude 自带的高频重试风暴。
+        body["max_tokens"] = json!(3);
+    }
     if should_normalize_mimo_anthropic_thinking_history(provider, &upstream_model) {
         normalize_mimo_anthropic_thinking_history(&mut body);
     }
@@ -939,17 +951,26 @@ fn apply_provider_to_paths(
     paths: &ClaudeDesktopPaths,
 ) -> Result<(), AppError> {
     if is_official_provider(provider) {
-        return restore_official_at_paths(paths);
+        let result = restore_official_at_paths(db, paths);
+        if result.is_ok() {
+            db.delete_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)?;
+        }
+        return result;
     }
 
     validate_provider(provider)?;
-    with_rollback(paths, |paths| {
+    let mode = provider_mode(provider);
+    let result = with_rollback(paths, |paths| {
         apply_provider_to_paths_inner(db, provider, paths)
-    })
+    });
+    if result.is_ok() && matches!(mode, ClaudeDesktopMode::Direct) {
+        db.delete_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)?;
+    }
+    result
 }
 
-fn restore_official_at_paths(paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
-    with_rollback(paths, restore_official_at_paths_inner)
+fn restore_official_at_paths(db: &Database, paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
+    with_rollback(paths, |paths| restore_official_at_paths_inner(db, paths))
 }
 
 fn with_rollback<F>(paths: &ClaudeDesktopPaths, op: F) -> Result<(), AppError>
@@ -978,6 +999,7 @@ fn apply_provider_to_paths_inner(
 ) -> Result<(), AppError> {
     let profile = match provider_mode(provider) {
         ClaudeDesktopMode::Direct => {
+            restore_cowork_auto_fallback(db, paths)?;
             let credentials = direct_gateway_credentials(provider)?;
             let model_specs = direct_inference_model_specs(provider)?;
             build_gateway_profile(
@@ -987,6 +1009,7 @@ fn apply_provider_to_paths_inner(
             )
         }
         ClaudeDesktopMode::Proxy => {
+            backup_and_disable_cowork_auto_fallback(db, paths)?;
             let base_url = proxy_gateway_base_url_from_db(db)?;
             let api_key = get_or_create_gateway_token(db)?;
             let routes = proxy_model_routes(provider)?;
@@ -1010,7 +1033,11 @@ fn apply_provider_to_paths_inner(
     Ok(())
 }
 
-fn restore_official_at_paths_inner(paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
+fn restore_official_at_paths_inner(
+    db: &Database,
+    paths: &ClaudeDesktopPaths,
+) -> Result<(), AppError> {
+    restore_cowork_auto_fallback(db, paths)?;
     write_deployment_mode(&paths.normal_config_path, "1p")?;
     write_deployment_mode(&paths.threep_config_path, "1p")?;
     remove_cc_switch_enterprise_config(&paths.threep_config_path)?;
@@ -1020,6 +1047,90 @@ fn restore_official_at_paths_inner(paths: &ClaudeDesktopPaths) -> Result<(), App
     }
     write_meta(&paths.meta_path, None)?;
 
+    Ok(())
+}
+
+fn cowork_auto_fallback_value(path: &Path) -> Result<Option<Value>, AppError> {
+    let value = read_json_or_empty(path)?;
+    Ok(value
+        .get("preferences")
+        .and_then(Value::as_object)
+        .and_then(|preferences| preferences.get(AUTO_FALLBACK_PREFERENCE_KEY))
+        .cloned())
+}
+
+fn backup_and_disable_cowork_auto_fallback(
+    db: &Database,
+    paths: &ClaudeDesktopPaths,
+) -> Result<(), AppError> {
+    if db.get_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)?.is_none() {
+        let backup = json!({
+            "normal": cowork_auto_fallback_value(&paths.normal_config_path)?,
+            "threep": cowork_auto_fallback_value(&paths.threep_config_path)?,
+        });
+        db.set_setting(
+            AUTO_FALLBACK_BACKUP_SETTING_KEY,
+            &serde_json::to_string(&backup).map_err(|error| AppError::Config(error.to_string()))?,
+        )?;
+    }
+
+    for path in [&paths.normal_config_path, &paths.threep_config_path] {
+        let mut root = read_json_or_empty(path)?;
+        let Some(root_object) = root.as_object_mut() else {
+            continue;
+        };
+        let preferences = root_object
+            .entry("preferences")
+            .or_insert_with(|| json!({}));
+        let Some(preferences) = preferences.as_object_mut() else {
+            continue;
+        };
+        let Some(by_account) = preferences
+            .get_mut(AUTO_FALLBACK_PREFERENCE_KEY)
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for enabled in by_account.values_mut() {
+            *enabled = Value::Bool(false);
+        }
+        write_json_file(path, &root)?;
+    }
+    Ok(())
+}
+
+fn restore_cowork_auto_fallback(db: &Database, paths: &ClaudeDesktopPaths) -> Result<(), AppError> {
+    let Some(raw_backup) = db.get_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)? else {
+        return Ok(());
+    };
+    let backup: Value = serde_json::from_str(&raw_backup)
+        .map_err(|error| AppError::Config(format!("解析 Claude 自动回退备份失败: {error}")))?;
+
+    for (slot, path) in [
+        ("normal", &paths.normal_config_path),
+        ("threep", &paths.threep_config_path),
+    ] {
+        let mut root = read_json_or_empty(path)?;
+        let Some(root_object) = root.as_object_mut() else {
+            continue;
+        };
+        let preferences = root_object
+            .entry("preferences")
+            .or_insert_with(|| json!({}));
+        let Some(preferences) = preferences.as_object_mut() else {
+            continue;
+        };
+
+        match backup.get(slot) {
+            Some(Value::Null) | None => {
+                preferences.remove(AUTO_FALLBACK_PREFERENCE_KEY);
+            }
+            Some(value) => {
+                preferences.insert(AUTO_FALLBACK_PREFERENCE_KEY.to_string(), value.clone());
+            }
+        }
+        write_json_file(path, &root)?;
+    }
     Ok(())
 }
 
@@ -1584,6 +1695,50 @@ mod tests {
     }
 
     #[test]
+    fn proxy_mode_takes_over_cowork_fallback_and_direct_mode_restores_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        let db = test_db();
+        let original = json!({
+            "preferences": {
+                "coworkModelAutoFallbackByAccount": {
+                    "account-a": true
+                }
+            }
+        });
+        write_json_file(&paths.normal_config_path, &original).expect("write normal config");
+        write_json_file(&paths.threep_config_path, &original).expect("write 3p config");
+
+        apply_provider_to_paths(&db, &proxy_provider("proxy"), &paths)
+            .expect("apply proxy provider");
+        for path in [&paths.normal_config_path, &paths.threep_config_path] {
+            let value: Value = read_json_file(path).expect("read disabled fallback config");
+            assert_eq!(
+                value["preferences"]["coworkModelAutoFallbackByAccount"]["account-a"],
+                json!(false)
+            );
+        }
+        assert!(db
+            .get_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)
+            .expect("read fallback backup")
+            .is_some());
+
+        apply_provider_to_paths(&db, &direct_provider("direct"), &paths)
+            .expect("apply direct provider");
+        for path in [&paths.normal_config_path, &paths.threep_config_path] {
+            let value: Value = read_json_file(path).expect("read restored fallback config");
+            assert_eq!(
+                value["preferences"]["coworkModelAutoFallbackByAccount"]["account-a"],
+                json!(true)
+            );
+        }
+        assert!(db
+            .get_setting(AUTO_FALLBACK_BACKUP_SETTING_KEY)
+            .expect("read cleared fallback backup")
+            .is_none());
+    }
+
+    #[test]
     fn claude_desktop_proxy_accepts_managed_oauth_providers_without_static_key() {
         for (provider_type, api_format) in [
             ("github_copilot", "openai_chat"),
@@ -1628,6 +1783,23 @@ mod tests {
         let err = map_proxy_request_model(json!({"model": "claude-opus-4-8"}), &provider)
             .expect_err("unknown route should fail");
         assert!(err.to_string().contains("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn claude_desktop_proxy_raises_internal_poll_max_tokens_to_compatible_minimum() {
+        let provider = proxy_provider("proxy");
+        let mapped = map_proxy_request_model(
+            json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1,
+                "stream": false,
+                "messages": []
+            }),
+            &provider,
+        )
+        .expect("map internal poll request");
+
+        assert_eq!(mapped["max_tokens"], json!(3));
     }
 
     #[test]
@@ -2133,7 +2305,7 @@ mod tests {
         let db = test_db();
 
         apply_provider_to_paths(&db, &provider, &paths).expect("apply provider");
-        restore_official_at_paths(&paths).expect("restore official");
+        restore_official_at_paths(&db, &paths).expect("restore official");
 
         let normal: Value = read_json_file(&paths.normal_config_path).expect("read normal config");
         let threep: Value = read_json_file(&paths.threep_config_path).expect("read 3p config");

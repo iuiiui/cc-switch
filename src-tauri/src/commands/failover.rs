@@ -189,7 +189,12 @@ pub async fn remove_from_failover_queue(
     state
         .db
         .remove_from_failover_queue(&app_type, &provider_id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    state
+        .proxy_service
+        .reset_provider_circuit_breaker(&provider_id, &app_type)
+        .await?;
+    Ok(())
 }
 
 /// 获取指定应用的自动故障转移开关状态（从 proxy_config 表读取）
@@ -253,6 +258,7 @@ pub async fn set_auto_failover_enabled(
         .get_proxy_config_for_app(&app_type)
         .await
         .map_err(|e| e.to_string())?;
+    let was_enabled = config.auto_failover_enabled;
 
     let app_enum = crate::app_config::AppType::from_str(&app_type)
         .map_err(|_| format!("无效的应用类型: {app_type}"))?;
@@ -393,6 +399,18 @@ pub async fn set_auto_failover_enabled(
         .update_proxy_config_for_app(config)
         .await
         .map_err(|e| e.to_string())?;
+
+    if was_enabled != enabled {
+        state
+            .db
+            .clear_provider_health_for_app(&app_type)
+            .await
+            .map_err(|e| e.to_string())?;
+        state
+            .proxy_service
+            .reset_app_failover_state(&app_type)
+            .await?;
+    }
 
     if let Some(provider_id) = activation_provider_id {
         // 发射 provider-switched 事件（让前端刷新当前供应商）

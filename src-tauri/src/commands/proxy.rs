@@ -340,9 +340,9 @@ pub async fn get_provider_health(
         .await
         .map_err(|e| e.to_string())?;
     if let Ok(config) = db.get_proxy_config_for_app(&app_type).await {
-        health.consecutive_failures = health
-            .consecutive_failures
-            .min(config.circuit_failure_threshold.max(1));
+        let threshold = config.circuit_failure_threshold.max(1);
+        health.consecutive_failures = health.consecutive_failures.min(threshold);
+        health.is_healthy = health.consecutive_failures < threshold;
     }
     Ok(health)
 }

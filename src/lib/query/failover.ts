@@ -55,6 +55,8 @@ export function useResetCircuitBreaker() {
       queryClient.invalidateQueries({
         queryKey: proxyKeys.status,
       });
+      queryClient.removeQueries({ queryKey: ["providerHealth"] });
+      queryClient.removeQueries({ queryKey: ["circuitBreakerStats"] });
     },
   });
 }

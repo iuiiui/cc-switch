@@ -5,6 +5,7 @@
 use super::hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES};
 use super::{
     body_filter::filter_private_params_with_whitelist,
+    circuit_breaker::AllowResult,
     content_encoding::{decompress_body_with_limit, get_content_encoding},
     error::*,
     failover_switch::FailoverSwitchManager,
@@ -281,38 +282,16 @@ impl RequestForwarder {
         }
     }
 
-    async fn record_success_result(
-        &self,
-        provider_id: &str,
-        app_type: &str,
-        used_half_open_permit: bool,
-    ) {
-        if used_half_open_permit {
-            if let Err(e) = self
-                .router
-                .record_result(provider_id, app_type, true, true, None)
-                .await
-            {
-                log::warn!(
-                    "[{app_type}] 记录 Provider 成功结果失败: provider_id={provider_id}, error={e}"
-                );
-            }
-            return;
+    async fn record_success_result(&self, provider_id: &str, app_type: &str, permit: AllowResult) {
+        if let Err(e) = self
+            .router
+            .record_result(provider_id, app_type, permit, true, None)
+            .await
+        {
+            log::warn!(
+                "[{app_type}] 记录 Provider 成功结果失败: provider_id={provider_id}, error={e}"
+            );
         }
-
-        let router = self.router.clone();
-        let provider_id = provider_id.to_string();
-        let app_type = app_type.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = router
-                .record_result(&provider_id, &app_type, false, true, None)
-                .await
-            {
-                log::warn!(
-                    "[{app_type}] 异步记录 Provider 成功结果失败: provider_id={provider_id}, error={e}"
-                );
-            }
-        });
     }
 
     /// 整流（thinking signature 或 budget）重试失败后的统一收尾。
@@ -327,7 +306,7 @@ impl RequestForwarder {
         retry_err: ProxyError,
         provider: &Provider,
         app_type_str: &str,
-        used_half_open_permit: bool,
+        permit: AllowResult,
         rectifier_label: &str,
         last_error: &mut Option<ProxyError>,
         last_provider: &mut Option<Provider>,
@@ -346,7 +325,7 @@ impl RequestForwarder {
                 .record_result(
                     &provider.id,
                     app_type_str,
-                    used_half_open_permit,
+                    permit,
                     false,
                     Some(retry_err.to_string()),
                 )
@@ -364,7 +343,7 @@ impl RequestForwarder {
         }
 
         self.router
-            .release_permit_neutral(&provider.id, app_type_str, used_half_open_permit)
+            .release_permit_neutral(&provider.id, app_type_str, permit)
             .await;
         let mut status = self.status.write().await;
         status.failed_requests += 1;
@@ -492,17 +471,12 @@ impl RequestForwarder {
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
             // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
-            let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
-                (true, false)
-            } else {
-                let permit = self
-                    .router
-                    .allow_provider_request(&provider.id, app_type_str)
-                    .await;
-                (permit.allowed, permit.used_half_open_permit)
-            };
+            let permit = self
+                .router
+                .begin_provider_request(&provider.id, app_type_str, bypass_circuit_breaker)
+                .await;
 
-            if !allowed {
+            if !permit.allowed {
                 continue;
             }
 
@@ -552,7 +526,7 @@ impl RequestForwarder {
                 Ok((response, claude_api_format, outbound_model)) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
-                    self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
+                    self.record_success_result(&provider.id, app_type_str, permit)
                         .await;
 
                     // 更新当前应用类型使用的 provider
@@ -652,12 +626,8 @@ impl RequestForwarder {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
-                                    self.record_success_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
+                                    self.record_success_result(&provider.id, app_type_str, permit)
+                                        .await;
 
                                     {
                                         let mut current_providers =
@@ -713,7 +683,7 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            permit,
                                             "media 降级",
                                             &mut last_error,
                                             &mut last_provider,
@@ -739,11 +709,7 @@ impl RequestForwarder {
                                 log::warn!("[{app_type_str}] [RECT-005] 整流器已触发过，不再重试");
                                 // 释放 HalfOpen permit（不记录熔断器，这是客户端兼容性问题）
                                 self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
+                                    .release_permit_neutral(&provider.id, app_type_str, permit)
                                     .await;
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
@@ -799,7 +765,7 @@ impl RequestForwarder {
                                         self.record_success_result(
                                             &provider.id,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            permit,
                                         )
                                         .await;
 
@@ -862,7 +828,7 @@ impl RequestForwarder {
                                                 retry_err,
                                                 provider,
                                                 app_type_str,
-                                                used_half_open_permit,
+                                                permit,
                                                 "整流",
                                                 &mut last_error,
                                                 &mut last_provider,
@@ -891,11 +857,7 @@ impl RequestForwarder {
                                     "[{app_type_str}] [RECT-013] budget 整流器已触发过，不再重试"
                                 );
                                 self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
+                                    .release_permit_neutral(&provider.id, app_type_str, permit)
                                     .await;
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
@@ -917,11 +879,7 @@ impl RequestForwarder {
                                     "[{app_type_str}] [RECT-014] budget 整流器触发但无可整流内容，不做无意义重试"
                                 );
                                 self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
+                                    .release_permit_neutral(&provider.id, app_type_str, permit)
                                     .await;
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
@@ -962,12 +920,8 @@ impl RequestForwarder {
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
-                                    self.record_success_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
+                                    self.record_success_result(&provider.id, app_type_str, permit)
+                                        .await;
 
                                     {
                                         let mut current_providers =
@@ -1022,7 +976,7 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            used_half_open_permit,
+                                            permit,
                                             "budget 整流",
                                             &mut last_error,
                                             &mut last_provider,
@@ -1039,11 +993,7 @@ impl RequestForwarder {
 
                     if signature_rectifier_non_retryable_client_error {
                         self.router
-                            .release_permit_neutral(
-                                &provider.id,
-                                app_type_str,
-                                used_half_open_permit,
-                            )
+                            .release_permit_neutral(&provider.id, app_type_str, permit)
                             .await;
                         let mut status = self.status.write().await;
                         status.failed_requests += 1;
@@ -1084,7 +1034,7 @@ impl RequestForwarder {
                                 .record_result(
                                     &provider.id,
                                     app_type_str,
-                                    used_half_open_permit,
+                                    permit,
                                     false,
                                     Some(e.to_string()),
                                 )
@@ -1112,11 +1062,7 @@ impl RequestForwarder {
                         ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
                             // 不可重试：客户端层错误或客户端断连 → 不污染健康度，仅释放 HalfOpen permit
                             self.router
-                                .release_permit_neutral(
-                                    &provider.id,
-                                    app_type_str,
-                                    used_half_open_permit,
-                                )
+                                .release_permit_neutral(&provider.id, app_type_str, permit)
                                 .await;
                             {
                                 let mut status = self.status.write().await;

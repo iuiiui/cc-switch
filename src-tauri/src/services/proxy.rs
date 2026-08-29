@@ -968,6 +968,34 @@ impl ProxyService {
             });
         }
 
+        // 新版本首次启动本地路由时重新投影当前 Claude Desktop proxy profile。
+        // 这会备份并关闭 Claude 自带的 coworkModelAutoFallbackByAccount，确保
+        // 供应商轮转只由 CC Switch 执行；Direct/Official 模式不在这里改写。
+        if let Ok(Some(current_id)) = crate::settings::get_effective_current_provider(
+            self.db.as_ref(),
+            &AppType::ClaudeDesktop,
+        ) {
+            if let Ok(Some(provider)) = self
+                .db
+                .get_provider_by_id(&current_id, AppType::ClaudeDesktop.as_str())
+            {
+                if matches!(
+                    crate::claude_desktop_config::provider_mode(&provider),
+                    crate::provider::ClaudeDesktopMode::Proxy
+                ) {
+                    crate::claude_desktop_config::apply_provider(self.db.as_ref(), &provider)
+                        .map_err(|e| format!("接管 Claude Desktop 自动回退失败: {e}"))?;
+                }
+            }
+        }
+
+        // provider_health 与内存熔断器都只描述当前代理运行期。异常退出或
+        // 安装升级可能绕过 stop_with_restore，启动新实例时必须丢弃旧记录。
+        self.db
+            .clear_all_provider_health()
+            .await
+            .map_err(|e| format!("清理上一运行期供应商健康状态失败: {e}"))?;
+
         // 4. 创建并启动服务器
         let app_handle = self.app_handle.read().await.clone();
         let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle);
@@ -4001,6 +4029,13 @@ impl ProxyService {
                 .reset_provider_circuit_breaker(provider_id, app_type)
                 .await;
             log::info!("已重置 Provider {provider_id} (app: {app_type}) 的熔断器");
+        }
+        Ok(())
+    }
+
+    pub async fn reset_app_failover_state(&self, app_type: &str) -> Result<(), String> {
+        if let Some(server) = self.server.read().await.as_ref() {
+            server.reset_app_failover_state(app_type).await;
         }
         Ok(())
     }

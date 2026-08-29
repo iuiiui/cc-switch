@@ -6,7 +6,9 @@ use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::circuit_breaker::{
+    AllowResult, CircuitBreaker, CircuitBreakerConfig, RecordDisposition,
+};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -183,10 +185,13 @@ impl ProviderRouter {
             .max(1);
         let duration = Duration::from_secs(seconds as u64);
         let key = format!("{app_type}:{provider_id}");
-        self.rate_limit_cooldowns
-            .write()
-            .await
-            .insert(key, Instant::now() + duration);
+        let now = Instant::now();
+        let mut cooldowns = self.rate_limit_cooldowns.write().await;
+        if let Some(until) = cooldowns.get(&key).copied().filter(|until| *until > now) {
+            return Ok(until.saturating_duration_since(now));
+        }
+        cooldowns.insert(key, now + duration);
+        drop(cooldowns);
         log::warn!("[{app_type}] 供应商 {provider_id} 触发速率限制，冷却 {seconds} 秒后再参与轮转");
         Ok(duration)
     }
@@ -204,6 +209,20 @@ impl ProviderRouter {
         }
     }
 
+    /// 清除指定应用的运行期熔断器与速率限制冷却。
+    /// 健康状态属于当前代理进程，重新启用故障转移时不继承上一轮状态。
+    pub async fn reset_app_runtime_state(&self, app_type: &str) {
+        let prefix = format!("{app_type}:");
+        self.circuit_breakers
+            .write()
+            .await
+            .retain(|key, _| !key.starts_with(&prefix));
+        self.rate_limit_cooldowns
+            .write()
+            .await
+            .retain(|key, _| !key.starts_with(&prefix));
+    }
+
     /// 请求执行前获取熔断器“放行许可”
     ///
     /// - Closed：直接放行
@@ -212,10 +231,26 @@ impl ProviderRouter {
     ///
     /// 注意：调用方必须在请求结束后通过 `record_result()` 释放 HalfOpen 名额，
     /// 否则会导致该 Provider 长时间无法进入探测状态。
+    #[allow(dead_code)]
     pub async fn allow_provider_request(&self, provider_id: &str, app_type: &str) -> AllowResult {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
         breaker.allow_request().await
+    }
+
+    pub async fn begin_provider_request(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        bypass_circuit_gate: bool,
+    ) -> AllowResult {
+        let circuit_key = format!("{app_type}:{provider_id}");
+        let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+        if bypass_circuit_gate {
+            breaker.tracking_permit()
+        } else {
+            breaker.allow_request().await
+        }
     }
 
     /// 记录供应商请求结果
@@ -223,7 +258,7 @@ impl ProviderRouter {
         &self,
         provider_id: &str,
         app_type: &str,
-        used_half_open_permit: bool,
+        permit: AllowResult,
         success: bool,
         error_msg: Option<String>,
     ) -> Result<(), AppError> {
@@ -237,10 +272,14 @@ impl ProviderRouter {
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
 
-        if success {
-            breaker.record_success(used_half_open_permit).await;
+        let disposition = if success {
+            breaker.record_success(permit).await
         } else {
-            breaker.record_failure(used_half_open_permit).await;
+            breaker.record_failure(permit).await
+        };
+
+        if disposition != RecordDisposition::Counted {
+            return Ok(());
         }
 
         // 3. 更新数据库健康状态（使用配置的阈值）
@@ -257,18 +296,11 @@ impl ProviderRouter {
         Ok(())
     }
 
-    /// 重置熔断器（手动恢复）
-    pub async fn reset_circuit_breaker(&self, circuit_key: &str) {
-        let breakers = self.circuit_breakers.read().await;
-        if let Some(breaker) = breakers.get(circuit_key) {
-            breaker.reset().await;
-        }
-    }
-
     /// 重置指定供应商的熔断器
     pub async fn reset_provider_breaker(&self, provider_id: &str, app_type: &str) {
         let circuit_key = format!("{app_type}:{provider_id}");
-        self.reset_circuit_breaker(&circuit_key).await;
+        self.circuit_breakers.write().await.remove(&circuit_key);
+        self.rate_limit_cooldowns.write().await.remove(&circuit_key);
     }
 
     /// 仅释放 HalfOpen permit，不影响健康统计（neutral 接口）
@@ -279,14 +311,11 @@ impl ProviderRouter {
         &self,
         provider_id: &str,
         app_type: &str,
-        used_half_open_permit: bool,
+        permit: AllowResult,
     ) {
-        if !used_half_open_permit {
-            return;
-        }
         let circuit_key = format!("{app_type}:{provider_id}");
         let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
-        breaker.release_half_open_permit();
+        breaker.release_neutral(permit);
     }
 
     /// 更新所有熔断器的配置（热更新）
@@ -564,6 +593,110 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["c", "a"]
         );
+
+        router.reset_app_runtime_state("claude").await;
+        let providers = router.select_providers("claude").await.unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "a"]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_failure_burst_counts_once() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id("burst".to_string(), "Burst".to_string(), json!({}), None);
+        db.save_provider("claude-desktop", &provider).unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude-desktop").await.unwrap();
+        config.circuit_failure_threshold = 3;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let permits = futures::future::join_all(
+            (0..20).map(|_| router.begin_provider_request("burst", "claude-desktop", false)),
+        )
+        .await;
+        for permit in permits {
+            router
+                .record_result(
+                    "burst",
+                    "claude-desktop",
+                    permit,
+                    false,
+                    Some("HTTP 429".to_string()),
+                )
+                .await
+                .unwrap();
+        }
+        let first_batch = db
+            .get_provider_health("burst", "claude-desktop")
+            .await
+            .unwrap();
+        assert_eq!(first_batch.consecutive_failures, 1);
+        assert!(first_batch.is_healthy);
+
+        let next_permit = router
+            .begin_provider_request("burst", "claude-desktop", false)
+            .await;
+        router
+            .record_result(
+                "burst",
+                "claude-desktop",
+                next_permit,
+                false,
+                Some("HTTP 429".to_string()),
+            )
+            .await
+            .unwrap();
+        let next_batch = db
+            .get_provider_health("burst", "claude-desktop")
+            .await
+            .unwrap();
+        assert_eq!(next_batch.consecutive_failures, 2);
+        assert!(next_batch.is_healthy);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_permit_after_runtime_reset_does_not_pollute_health() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let provider = Provider::with_id("stale".to_string(), "Stale".to_string(), json!({}), None);
+        db.save_provider("claude-desktop", &provider).unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let old_permit = router
+            .begin_provider_request("stale", "claude-desktop", false)
+            .await;
+        router
+            .reset_provider_breaker("stale", "claude-desktop")
+            .await;
+        db.reset_provider_health("stale", "claude-desktop")
+            .await
+            .unwrap();
+
+        router
+            .record_result(
+                "stale",
+                "claude-desktop",
+                old_permit,
+                false,
+                Some("late HTTP 429".to_string()),
+            )
+            .await
+            .unwrap();
+        let health = db
+            .get_provider_health("stale", "claude-desktop")
+            .await
+            .unwrap();
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.is_healthy);
     }
 
     #[tokio::test]
@@ -699,8 +832,9 @@ mod tests {
 
         let router = ProviderRouter::new(db.clone());
 
+        let permit = router.begin_provider_request("b", "claude", false).await;
         router
-            .record_result("b", "claude", false, false, Some("fail".to_string()))
+            .record_result("b", "claude", permit, false, Some("fail".to_string()))
             .await
             .unwrap();
 
@@ -738,8 +872,15 @@ mod tests {
         let router = ProviderRouter::new(db.clone());
 
         // 触发熔断：1 次失败
+        let failure_permit = router.begin_provider_request("a", "claude", false).await;
         router
-            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .record_result(
+                "a",
+                "claude",
+                failure_permit,
+                false,
+                Some("fail".to_string()),
+            )
             .await
             .unwrap();
 
@@ -753,9 +894,7 @@ mod tests {
         assert!(!second.allowed);
 
         // 使用 release_permit_neutral 释放名额（不影响健康统计）
-        router
-            .release_permit_neutral("a", "claude", first.used_half_open_permit)
-            .await;
+        router.release_permit_neutral("a", "claude", first).await;
 
         // 第三次请求应被允许（名额已释放）
         let third = router.allow_provider_request("a", "claude").await;

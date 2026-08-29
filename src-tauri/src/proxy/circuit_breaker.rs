@@ -5,7 +5,7 @@
 use super::log_codes::cb as log_cb;
 use super::types::AppProxyConfig;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -74,6 +74,7 @@ impl Default for CircuitBreakerConfig {
 
 /// 熔断器实例
 pub struct CircuitBreaker {
+    instance_id: u64,
     /// 当前状态
     state: Arc<RwLock<CircuitState>>,
     /// 连续失败计数
@@ -90,7 +91,11 @@ pub struct CircuitBreaker {
     config: Arc<RwLock<CircuitBreakerConfig>>,
     /// 半开状态已放行的请求数（用于限流）
     half_open_requests: Arc<AtomicU32>,
+    /// 当前出站许可代际。首个完成结果会推进代际，同代其它并发结果不重复计数。
+    failure_generation: Arc<AtomicU64>,
 }
+
+static NEXT_BREAKER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 熔断器放行结果
 ///
@@ -100,12 +105,22 @@ pub struct CircuitBreaker {
 pub struct AllowResult {
     pub allowed: bool,
     pub used_half_open_permit: bool,
+    pub(crate) breaker_instance: u64,
+    pub(crate) failure_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordDisposition {
+    Counted,
+    DuplicateBatch,
+    Stale,
 }
 
 impl CircuitBreaker {
     /// 创建新的熔断器
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
+            instance_id: NEXT_BREAKER_INSTANCE_ID.fetch_add(1, Ordering::SeqCst),
             state: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(AtomicU32::new(0)),
             consecutive_successes: Arc::new(AtomicU32::new(0)),
@@ -114,6 +129,7 @@ impl CircuitBreaker {
             last_opened_at: Arc::new(RwLock::new(None)),
             config: Arc::new(RwLock::new(config)),
             half_open_requests: Arc::new(AtomicU32::new(0)),
+            failure_generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -161,6 +177,8 @@ impl CircuitBreaker {
             CircuitState::Closed => AllowResult {
                 allowed: true,
                 used_half_open_permit: false,
+                breaker_instance: self.instance_id,
+                failure_generation: self.failure_generation.load(Ordering::SeqCst),
             },
             CircuitState::Open => {
                 let config = self.config.read().await;
@@ -180,11 +198,15 @@ impl CircuitBreaker {
                             CircuitState::Closed => AllowResult {
                                 allowed: true,
                                 used_half_open_permit: false,
+                                breaker_instance: self.instance_id,
+                                failure_generation: self.failure_generation.load(Ordering::SeqCst),
                             },
                             CircuitState::HalfOpen => self.allow_half_open_probe(),
                             CircuitState::Open => AllowResult {
                                 allowed: false,
                                 used_half_open_permit: false,
+                                breaker_instance: self.instance_id,
+                                failure_generation: self.failure_generation.load(Ordering::SeqCst),
                             },
                         };
                     }
@@ -193,19 +215,57 @@ impl CircuitBreaker {
                 AllowResult {
                     allowed: false,
                     used_half_open_permit: false,
+                    breaker_instance: self.instance_id,
+                    failure_generation: self.failure_generation.load(Ordering::SeqCst),
                 }
             }
             CircuitState::HalfOpen => self.allow_half_open_probe(),
         }
     }
 
+    /// 故障转移关闭/仅一家供应商时仍取得计数代际，但不执行 Open 门禁。
+    pub fn tracking_permit(&self) -> AllowResult {
+        AllowResult {
+            allowed: true,
+            used_half_open_permit: false,
+            breaker_instance: self.instance_id,
+            failure_generation: self.failure_generation.load(Ordering::SeqCst),
+        }
+    }
+
+    pub fn release_neutral(&self, permit: AllowResult) -> RecordDisposition {
+        if permit.breaker_instance != self.instance_id {
+            return RecordDisposition::Stale;
+        }
+        if permit.used_half_open_permit {
+            self.release_half_open_permit();
+        }
+        RecordDisposition::Counted
+    }
+
     /// 记录成功
-    pub async fn record_success(&self, used_half_open_permit: bool) {
+    pub async fn record_success(&self, permit: AllowResult) -> RecordDisposition {
+        if permit.breaker_instance != self.instance_id {
+            return RecordDisposition::Stale;
+        }
         let state = *self.state.read().await;
         let config = self.config.read().await;
 
-        if used_half_open_permit {
+        if permit.used_half_open_permit {
             self.release_half_open_permit();
+        }
+
+        if self
+            .failure_generation
+            .compare_exchange(
+                permit.failure_generation,
+                permit.failure_generation.saturating_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return RecordDisposition::DuplicateBatch;
         }
 
         // 重置失败计数
@@ -224,21 +284,38 @@ impl CircuitBreaker {
                 self.transition_to_closed().await;
             }
         }
+        RecordDisposition::Counted
     }
 
     /// 记录失败
-    pub async fn record_failure(&self, used_half_open_permit: bool) {
+    pub async fn record_failure(&self, permit: AllowResult) -> RecordDisposition {
+        if permit.breaker_instance != self.instance_id {
+            return RecordDisposition::Stale;
+        }
         let state = *self.state.read().await;
         let config = self.config.read().await;
 
-        if used_half_open_permit {
+        if permit.used_half_open_permit {
             self.release_half_open_permit();
         }
 
         // Open 之后才返回的同批在途请求只完成日志链路，不再污染熔断统计。
         // 它们在 Open 之前已经发往上游，无法撤回，但也不应继续累加失败数。
         if state == CircuitState::Open {
-            return;
+            return RecordDisposition::Stale;
+        }
+
+        if self
+            .failure_generation
+            .compare_exchange(
+                permit.failure_generation,
+                permit.failure_generation.saturating_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return RecordDisposition::DuplicateBatch;
         }
 
         // 更新计数器
@@ -291,6 +368,7 @@ impl CircuitBreaker {
             }
             _ => {}
         }
+        RecordDisposition::Counted
     }
 
     /// 获取当前状态
@@ -327,6 +405,8 @@ impl CircuitBreaker {
             AllowResult {
                 allowed: true,
                 used_half_open_permit: true,
+                breaker_instance: self.instance_id,
+                failure_generation: self.failure_generation.load(Ordering::SeqCst),
             }
         } else {
             // 超过限额，回退计数，拒绝请求
@@ -334,6 +414,8 @@ impl CircuitBreaker {
             AllowResult {
                 allowed: false,
                 used_half_open_permit: false,
+                breaker_instance: self.instance_id,
+                failure_generation: self.failure_generation.load(Ordering::SeqCst),
             }
         }
     }
@@ -408,6 +490,12 @@ pub struct CircuitBreakerStats {
 mod tests {
     use super::*;
 
+    async fn record_one_failure(breaker: &CircuitBreaker) -> RecordDisposition {
+        let permit = breaker.allow_request().await;
+        assert!(permit.allowed);
+        breaker.record_failure(permit).await
+    }
+
     #[tokio::test]
     async fn test_circuit_breaker_closed_to_open() {
         let config = CircuitBreakerConfig {
@@ -422,7 +510,10 @@ mod tests {
 
         // 记录 3 次失败
         for _ in 0..3 {
-            breaker.record_failure(false).await;
+            assert_eq!(
+                record_one_failure(&breaker).await,
+                RecordDisposition::Counted
+            );
         }
 
         // 应该转换到打开状态
@@ -437,12 +528,21 @@ mod tests {
             ..Default::default()
         });
 
-        breaker.record_failure(false).await;
+        let permits = (0..21)
+            .map(|_| breaker.tracking_permit())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            breaker.record_failure(permits[0]).await,
+            RecordDisposition::Counted
+        );
         assert_eq!(breaker.get_state().await, CircuitState::Open);
         let before = breaker.get_stats().await;
 
-        for _ in 0..20 {
-            breaker.record_failure(false).await;
+        for permit in permits.into_iter().skip(1) {
+            assert_ne!(
+                breaker.record_failure(permit).await,
+                RecordDisposition::Counted
+            );
         }
 
         let after = breaker.get_stats().await;
@@ -460,8 +560,8 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // 打开熔断器
-        breaker.record_failure(false).await;
-        breaker.record_failure(false).await;
+        record_one_failure(&breaker).await;
+        record_one_failure(&breaker).await;
         assert_eq!(breaker.get_state().await, CircuitState::Open);
 
         // 手动转换到半开状态
@@ -469,8 +569,12 @@ mod tests {
         assert_eq!(breaker.get_state().await, CircuitState::HalfOpen);
 
         // 记录 2 次成功
-        breaker.record_success(false).await;
-        breaker.record_success(false).await;
+        let first_success = breaker.allow_request().await;
+        assert!(first_success.allowed);
+        breaker.record_success(first_success).await;
+        let second_success = breaker.allow_request().await;
+        assert!(second_success.allowed);
+        breaker.record_success(second_success).await;
 
         // 应该转换到关闭状态
         assert_eq!(breaker.get_state().await, CircuitState::Closed);
@@ -509,8 +613,8 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // 打开熔断器
-        breaker.record_failure(false).await;
-        breaker.record_failure(false).await;
+        record_one_failure(&breaker).await;
+        record_one_failure(&breaker).await;
         assert_eq!(breaker.get_state().await, CircuitState::Open);
 
         // 重置
