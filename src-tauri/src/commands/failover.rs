@@ -410,6 +410,19 @@ pub async fn set_auto_failover_enabled(
             .proxy_service
             .reset_app_failover_state(&app_type)
             .await?;
+        if is_claude_desktop {
+            let provider_count = if enabled {
+                state
+                    .db
+                    .get_failover_queue(&app_type)
+                    .map_err(|error| error.to_string())?
+                    .len()
+            } else {
+                1
+            };
+            let target_limit = if provider_count <= 1 { 2 } else { 1 };
+            crate::proxy::reset_claude_desktop_adaptive_runtime(target_limit).await;
+        }
     }
 
     if let Some(provider_id) = activation_provider_id {

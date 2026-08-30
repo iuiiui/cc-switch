@@ -39,7 +39,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use tauri::Manager;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
@@ -115,6 +115,7 @@ pub struct ForwardResult {
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
     upstream_permit: Option<AdaptiveConcurrencyPermit>,
+    global_upstream_permit: Option<OwnedSemaphorePermit>,
     stream_outcome: Option<StreamProviderOutcome>,
 }
 
@@ -322,6 +323,7 @@ impl Drop for CircuitPermitGuard {
 pub(crate) struct ActiveConnectionGuard {
     status: Arc<RwLock<ProxyStatus>>,
     _upstream_permit: Option<AdaptiveConcurrencyPermit>,
+    _global_upstream_permit: Option<OwnedSemaphorePermit>,
     stream_outcome: Option<StreamProviderOutcome>,
 }
 
@@ -329,9 +331,9 @@ pub(crate) struct ActiveConnectionGuard {
 struct AdaptiveConcurrencyState {
     active: usize,
     limit: usize,
+    reset_limit: usize,
     congestion_until: Option<std::time::Instant>,
     successes_since_increase: u32,
-    last_pressure_increase: Option<std::time::Instant>,
 }
 
 struct AdaptiveConcurrencyLimiter {
@@ -342,6 +344,164 @@ struct AdaptiveConcurrencyLimiter {
     notify: Notify,
 }
 
+struct AdaptiveLaunchGate {
+    last_start: TokioMutex<Option<std::time::Instant>>,
+    state: std::sync::Mutex<AdaptiveLaunchGateState>,
+}
+
+struct AdaptiveLaunchGateState {
+    interval_ms: u64,
+    successes_since_recovery: u32,
+    congestion_until: Option<std::time::Instant>,
+}
+
+impl AdaptiveLaunchGate {
+    const NORMAL_INTERVAL_MS: u64 = 750;
+    const CONGESTED_INTERVAL_MS: u64 = 2_000;
+    const SUCCESSES_PER_RECOVERY_STEP: u32 = 8;
+
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            last_start: TokioMutex::new(None),
+            state: std::sync::Mutex::new(AdaptiveLaunchGateState {
+                interval_ms: Self::NORMAL_INTERVAL_MS,
+                successes_since_recovery: 0,
+                congestion_until: None,
+            }),
+        })
+    }
+
+    async fn wait_turn<F, Fut>(
+        &self,
+        deadline: std::time::Instant,
+        validate: F,
+    ) -> Result<Option<std::time::Duration>, ProxyError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        // 持锁等待是有意设计：tokio Mutex 的队列把所有 Provider 的“请求启动”
+        // 串成稳定节奏，但锁在真正发出请求前释放，不覆盖响应头或长流生命周期。
+        let queued_at = std::time::Instant::now();
+        let mut last_start = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.last_start.lock(),
+        )
+        .await
+        .map_err(|_| ProxyError::Timeout("全局请求启动队列超过本轮 45 秒预算".to_string()))?;
+        loop {
+            let interval_ms = self
+                .state
+                .lock()
+                .expect("launch gate state lock poisoned")
+                .interval_ms;
+            let interval = std::time::Duration::from_millis(interval_ms.max(1));
+            let now = std::time::Instant::now();
+            let earliest = last_start.map(|last| last + interval).unwrap_or(now);
+            let delay = earliest.saturating_duration_since(now);
+            if delay.is_zero() {
+                // 校验与 last_start 提交处于同一 gate 临界区。已 cooldown 的
+                // 候选不会写入时间戳，也就不会让后续 waiter 白等 750ms/2s。
+                let valid =
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), validate())
+                        .await
+                        .map_err(|_| {
+                            ProxyError::Timeout("全局请求启动校验超过本轮 45 秒预算".to_string())
+                        })?;
+                if !valid {
+                    return Ok(None);
+                }
+                let committed_at = std::time::Instant::now();
+                if committed_at > deadline {
+                    return Err(ProxyError::Timeout(
+                        "全局请求启动校验超过本轮 45 秒预算".to_string(),
+                    ));
+                }
+                *last_start = Some(committed_at);
+                return Ok(Some(queued_at.elapsed()));
+            }
+            if now >= deadline || delay > deadline.saturating_duration_since(now) {
+                return Err(ProxyError::Timeout(
+                    "全局请求启动队列超过本轮 45 秒预算".to_string(),
+                ));
+            }
+            tokio::time::sleep(delay).await;
+            // 429 可能在 sleep 期间把间隔从 750ms 拉长到 2s；重新读取并计算，
+            // 避免已经排队的启动请求继续按旧速率冲出去。
+        }
+    }
+
+    fn mark_rate_limited(&self, cooldown: std::time::Duration) {
+        let until = std::time::Instant::now() + cooldown.max(std::time::Duration::from_millis(1));
+        let mut state = self.state.lock().expect("launch gate state lock poisoned");
+        state.congestion_until = Some(
+            state
+                .congestion_until
+                .map(|current| current.max(until))
+                .unwrap_or(until),
+        );
+        state.interval_ms = Self::CONGESTED_INTERVAL_MS;
+        state.successes_since_recovery = 0;
+        drop(state);
+        log::warn!(
+            "[claude-desktop] 全局启动闸门降速到 {}ms，{} 秒内禁止恢复",
+            Self::CONGESTED_INTERVAL_MS,
+            cooldown.as_secs().max(1)
+        );
+    }
+
+    fn mark_success(&self) {
+        let now = std::time::Instant::now();
+        let mut state = self.state.lock().expect("launch gate state lock poisoned");
+        if state.congestion_until.is_some_and(|until| until > now) {
+            return;
+        }
+        state.congestion_until = None;
+        state.successes_since_recovery = state.successes_since_recovery.saturating_add(1);
+        if state.successes_since_recovery < Self::SUCCESSES_PER_RECOVERY_STEP {
+            return;
+        }
+        state.successes_since_recovery = 0;
+        let previous = state.interval_ms;
+        let next = previous.saturating_sub(250).max(Self::NORMAL_INTERVAL_MS);
+        if next < previous {
+            state.interval_ms = next;
+            drop(state);
+            log::info!(
+                "[claude-desktop] 全局启动闸门累计 {} 次完整成功，间隔 {}ms → {}ms",
+                Self::SUCCESSES_PER_RECOVERY_STEP,
+                previous,
+                next
+            );
+        }
+    }
+
+    fn mark_failure(&self) {
+        self.state
+            .lock()
+            .expect("launch gate state lock poisoned")
+            .successes_since_recovery = 0;
+    }
+
+    async fn reset(&self) {
+        {
+            let mut state = self.state.lock().expect("launch gate state lock poisoned");
+            state.interval_ms = Self::NORMAL_INTERVAL_MS;
+            state.successes_since_recovery = 0;
+            state.congestion_until = None;
+        }
+        *self.last_start.lock().await = None;
+    }
+
+    #[cfg(test)]
+    fn current_interval_ms(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("launch gate state lock poisoned")
+            .interval_ms
+    }
+}
+
 impl AdaptiveConcurrencyLimiter {
     fn new(initial_limit: usize, max_limit: usize) -> Arc<Self> {
         let max_limit = max_limit.max(1);
@@ -349,13 +509,13 @@ impl AdaptiveConcurrencyLimiter {
         Arc::new(Self {
             min_limit: 1,
             max_limit,
-            successes_per_slot: 4,
+            successes_per_slot: 8,
             state: std::sync::Mutex::new(AdaptiveConcurrencyState {
                 active: 0,
                 limit: initial_limit,
+                reset_limit: initial_limit,
                 congestion_until: None,
                 successes_since_increase: 0,
-                last_pressure_increase: None,
             }),
             notify: Notify::new(),
         })
@@ -422,46 +582,6 @@ impl AdaptiveConcurrencyLimiter {
         })
     }
 
-    /// 有排队压力且最近没有 429 时，每秒最多把窗口增加一个槽位。
-    ///
-    /// 这让长流不会把后续请求无限饿死，同时保持硬上限；429 cooldown 期间
-    /// 完全禁止压力扩窗，避免为了消除排队又制造并发风暴。
-    fn try_acquire_under_pressure(
-        self: &Arc<Self>,
-        min_increase_interval: std::time::Duration,
-    ) -> Option<AdaptiveConcurrencyPermit> {
-        let now = std::time::Instant::now();
-        let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
-        let current_limit = self.current_limit_locked(&mut state, now);
-        if state.active < current_limit {
-            state.active += 1;
-            return Some(AdaptiveConcurrencyPermit {
-                limiter: self.clone(),
-            });
-        }
-        if state.congestion_until.is_some()
-            || current_limit >= self.max_limit
-            || state.active >= self.max_limit
-            || state
-                .last_pressure_increase
-                .is_some_and(|last| now.duration_since(last) < min_increase_interval)
-        {
-            return None;
-        }
-
-        state.limit = (current_limit + 1).min(self.max_limit);
-        state.active += 1;
-        state.last_pressure_increase = Some(now);
-        log::info!(
-            "[claude-desktop] 检测到持续排队，动态并发窗口 {} → {}",
-            current_limit,
-            state.limit
-        );
-        Some(AdaptiveConcurrencyPermit {
-            limiter: self.clone(),
-        })
-    }
-
     fn release(&self) {
         {
             let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
@@ -494,6 +614,49 @@ impl AdaptiveConcurrencyLimiter {
             cooldown.as_secs().max(1)
         );
         self.notify.notify_waiters();
+    }
+
+    fn mark_failure(&self) {
+        let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+        state.successes_since_increase = 0;
+    }
+
+    fn reset_runtime(&self, target_limit: usize) {
+        {
+            let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+            // 保留 active：toggle 时旧流仍持有本 limiter。若 active=2、重置后
+            // limit=1，必须等两条旧流都退出后才能放新请求，不能另建 active=0
+            // 的 limiter 绕过单 Provider 上限。
+            let target_limit = target_limit.max(self.min_limit).min(self.max_limit);
+            state.reset_limit = target_limit;
+            state.limit = target_limit;
+            state.congestion_until = None;
+            state.successes_since_increase = 0;
+        }
+        self.notify.notify_waiters();
+        claude_desktop_capacity_notify().notify_waiters();
+    }
+
+    fn update_mode_initial_limit(&self, target_limit: usize) {
+        let mut changed = false;
+        {
+            let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+            let target_limit = target_limit.max(self.min_limit).min(self.max_limit);
+            if state.reset_limit != target_limit {
+                state.reset_limit = target_limit;
+                // 模式变化时立即采用新基线但保留 active；active 大于新 limit 时
+                // 自然排空。429 cooldown 期间不提前扩回 2。
+                if state.congestion_until.is_none() {
+                    state.limit = target_limit;
+                }
+                state.successes_since_increase = 0;
+                changed = true;
+            }
+        }
+        if changed {
+            self.notify.notify_waiters();
+            claude_desktop_capacity_notify().notify_waiters();
+        }
     }
 
     fn mark_success(&self) {
@@ -546,10 +709,17 @@ struct AdaptiveConcurrencyPermit {
 impl AdaptiveConcurrencyPermit {
     fn mark_success(&self) {
         self.limiter.mark_success();
+        claude_desktop_launch_gate().mark_success();
+    }
+
+    fn mark_failure(&self) {
+        self.limiter.mark_failure();
+        claude_desktop_launch_gate().mark_failure();
     }
 
     fn mark_rate_limited(&self, cooldown: std::time::Duration) {
         self.limiter.mark_rate_limited(cooldown);
+        claude_desktop_launch_gate().mark_rate_limited(cooldown);
     }
 }
 
@@ -568,6 +738,7 @@ impl ActiveConnectionGuard {
         Self {
             status,
             _upstream_permit: None,
+            _global_upstream_permit: None,
             stream_outcome: None,
         }
     }
@@ -575,9 +746,11 @@ impl ActiveConnectionGuard {
     fn attach_upstream_permit(
         &mut self,
         permit: Option<AdaptiveConcurrencyPermit>,
+        global_permit: Option<OwnedSemaphorePermit>,
         stream_outcome: Option<StreamProviderOutcome>,
     ) {
         self._upstream_permit = permit;
+        self._global_upstream_permit = global_permit;
         self.stream_outcome = stream_outcome;
     }
 
@@ -597,6 +770,8 @@ impl ActiveConnectionGuard {
             if let Some(permit) = self._upstream_permit.as_ref() {
                 permit.mark_rate_limited(std::time::Duration::from_secs(30));
             }
+        } else if let Some(permit) = self._upstream_permit.as_ref() {
+            permit.mark_failure();
         }
         if let Some(outcome) = self.stream_outcome.as_mut() {
             outcome.finish_failure(combined, rate_limited).await;
@@ -604,6 +779,9 @@ impl ActiveConnectionGuard {
     }
 
     pub(crate) async fn mark_stream_failure(&mut self, message: &str) {
+        if let Some(permit) = self._upstream_permit.as_ref() {
+            permit.mark_failure();
+        }
         if let Some(outcome) = self.stream_outcome.as_mut() {
             outcome.finish_failure(message.to_string(), false).await;
         }
@@ -615,20 +793,84 @@ fn claude_desktop_capacity_notify() -> &'static Notify {
     NOTIFY.get_or_init(Notify::new)
 }
 
-fn claude_desktop_upstream_limiter(provider_id: &str) -> Arc<AdaptiveConcurrencyLimiter> {
-    static LIMITERS: OnceLock<std::sync::Mutex<HashMap<String, Arc<AdaptiveConcurrencyLimiter>>>> =
-        OnceLock::new();
-    let mut limiters = LIMITERS
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+fn claude_desktop_global_concurrency() -> Arc<Semaphore> {
+    static GLOBAL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    // b.ai-1/2/3 可能共享上游容量池：即使每家各自健康，也不允许总长流超过 3。
+    GLOBAL.get_or_init(|| Arc::new(Semaphore::new(3))).clone()
+}
+
+fn claude_desktop_launch_gate() -> Arc<AdaptiveLaunchGate> {
+    static GATE: OnceLock<Arc<AdaptiveLaunchGate>> = OnceLock::new();
+    GATE.get_or_init(AdaptiveLaunchGate::new).clone()
+}
+
+async fn wait_for_claude_desktop_launch(
+    app_type: &AppType,
+    provider: &Provider,
+    router: &ProviderRouter,
+    app_type_str: &str,
+    deadline: std::time::Instant,
+) -> Result<bool, ProxyError> {
+    if !matches!(app_type, AppType::ClaudeDesktop) {
+        return Ok(true);
+    }
+    let waited = claude_desktop_launch_gate()
+        .wait_turn(deadline, || async {
+            !router
+                .is_provider_rate_limited(&provider.id, app_type_str)
+                .await
+        })
+        .await?;
+    let Some(waited) = waited else {
+        return Ok(false);
+    };
+    if waited >= std::time::Duration::from_millis(100) {
+        log::info!(
+            "[claude-desktop] 全局启动闸门等待 {}ms 后发往 Provider {}",
+            waited.as_millis(),
+            provider.name
+        );
+    }
+    Ok(true)
+}
+
+fn claude_desktop_upstream_limiter(
+    provider_id: &str,
+    initial_limit: usize,
+) -> Arc<AdaptiveConcurrencyLimiter> {
+    let mut limiters = claude_desktop_upstream_limiter_registry()
         .lock()
         .expect("claude desktop limiter registry lock poisoned");
-    limiters
+    let limiter = limiters
         .entry(provider_id.to_string())
-        // 每家从 1 开始；有排队压力且没有 429 时最多升到 2。三家队列
-        // 合计最多 6 条在途，既覆盖 Claude 的前台 + 后台 Agent，又不重现
-        // 旧版单家瞬间堆到 4 后连续 429 的并发风暴。
-        .or_insert_with(|| AdaptiveConcurrencyLimiter::new(1, 2))
-        .clone()
+        // 多 Provider 时每家初始 1，单 Provider 时初始 2；窗口只凭连续完整
+        // 成功增长，且全局长流硬上限 3，不再出现三家压力扩窗到总并发 6。
+        .or_insert_with(|| AdaptiveConcurrencyLimiter::new(initial_limit, 2))
+        .clone();
+    drop(limiters);
+    limiter.update_mode_initial_limit(initial_limit);
+    limiter
+}
+
+fn claude_desktop_upstream_limiter_registry(
+) -> &'static std::sync::Mutex<HashMap<String, Arc<AdaptiveConcurrencyLimiter>>> {
+    static LIMITERS: OnceLock<std::sync::Mutex<HashMap<String, Arc<AdaptiveConcurrencyLimiter>>>> =
+        OnceLock::new();
+    LIMITERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+pub(crate) async fn reset_claude_desktop_adaptive_runtime(target_limit: usize) {
+    let limiters = claude_desktop_upstream_limiter_registry()
+        .lock()
+        .expect("claude desktop limiter registry lock poisoned")
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for limiter in limiters {
+        limiter.reset_runtime(target_limit);
+    }
+    claude_desktop_launch_gate().reset().await;
+    log::info!("[claude-desktop] 已重置动态并发窗口与全局启动闸门");
 }
 
 impl Drop for ActiveConnectionGuard {
@@ -876,19 +1118,41 @@ impl RequestForwarder {
         provider: &Provider,
         app_type_str: &str,
         circuit_permit: &mut CircuitPermitGuard,
+        upstream_permit: Option<&AdaptiveConcurrencyPermit>,
         rectifier_label: &str,
         last_error: &mut Option<ProxyError>,
         last_provider: &mut Option<Provider>,
     ) -> Option<ForwardError> {
         // Provider 错误：本家上游/网络确实出问题，下一家 provider 可能可用 → 继续故障转移。
         // 客户端错误：整流后请求仍违法，下一家也修不好 → 直接返回。
-        let is_provider_error = match &retry_err {
-            ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => true,
-            ProxyError::UpstreamError { status, .. } => *status >= 500,
-            _ => false,
-        };
+        let rate_limited = is_rate_limit_error(&retry_err);
+        let is_provider_error = rate_limited
+            || match &retry_err {
+                ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => true,
+                ProxyError::UpstreamError { status, .. } => *status >= 500,
+                _ => false,
+            };
 
         if is_provider_error {
+            if rate_limited {
+                match self
+                    .router
+                    .mark_provider_rate_limited(&provider.id, app_type_str)
+                    .await
+                {
+                    Ok(cooldown) => {
+                        if let Some(permit) = upstream_permit {
+                            permit.mark_rate_limited(cooldown);
+                        }
+                    }
+                    Err(error) => log::warn!(
+                        "[{app_type_str}] 记录供应商 {} 的整流重试速率限制失败: {error}",
+                        provider.id
+                    ),
+                }
+            } else if let Some(permit) = upstream_permit {
+                permit.mark_failure();
+            }
             let _ = self
                 .router
                 .record_result(
@@ -962,7 +1226,11 @@ impl RequestForwarder {
         // Err 路径：guard 在函数 scope 内随返回值落地时自动 drop。
         match result {
             Ok(mut fr) => {
-                guard.attach_upstream_permit(fr.upstream_permit.take(), fr.stream_outcome.take());
+                guard.attach_upstream_permit(
+                    fr.upstream_permit.take(),
+                    fr.global_upstream_permit.take(),
+                    fr.stream_outcome.take(),
+                );
                 fr.connection_guard = Some(guard);
                 Ok(fr)
             }
@@ -1019,7 +1287,6 @@ impl RequestForwarder {
         // max_retries 仍有剩余额度时可进入下一轮，而不是立即把错误交回 Claude
         // 触发它自己的 10 次指数退避重试。
         let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-        let capacity_wait_started = std::time::Instant::now();
         let mut consecutive_capacity_skips = 0usize;
         let max_schedule_slots = if matches!(app_type, AppType::ClaudeDesktop) {
             // AIMD 饱和跳过不算真实 attempt；额外调度槽只用于等待其它 Provider
@@ -1119,17 +1386,12 @@ impl RequestForwarder {
             }
 
             // 每个 Provider 有独立 AIMD 窗口。某家被长流占满时立即检查下一家，
-            // 而不是在全局队列里无限等待；所有候选都满时等待释放通知，并在没有
-            // 429 的前提下按排队压力每秒最多扩一格，单家硬上限仍是 2。
+            // 而不是在全局队列里无限等待。窗口只能由完整成功缓慢增加，排队本身
+            // 不再扩窗，避免三家在同一秒从 1 → 2 形成总并发 6 的请求突发。
             let upstream_permit = if matches!(app_type, AppType::ClaudeDesktop) {
-                let limiter = claude_desktop_upstream_limiter(&provider.id);
-                let permit = limiter.try_acquire().or_else(|| {
-                    (capacity_wait_started.elapsed() >= std::time::Duration::from_secs(1))
-                        .then(|| {
-                            limiter.try_acquire_under_pressure(std::time::Duration::from_secs(1))
-                        })
-                        .flatten()
-                });
+                let initial_limit = if providers.len() == 1 { 2 } else { 1 };
+                let limiter = claude_desktop_upstream_limiter(&provider.id, initial_limit);
+                let permit = limiter.try_acquire();
                 let Some(permit) = permit else {
                     consecutive_capacity_skips = consecutive_capacity_skips.saturating_add(1);
                     if consecutive_capacity_skips >= providers.len() {
@@ -1155,6 +1417,43 @@ impl RequestForwarder {
             } else {
                 None
             };
+
+            let global_upstream_permit =
+                if should_limit_claude_desktop_long_stream(app_type, client_requested_stream) {
+                    let queued_at = std::time::Instant::now();
+                    match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(retry_deadline),
+                        claude_desktop_global_concurrency().acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => {
+                            if queued_at.elapsed() >= std::time::Duration::from_millis(100) {
+                                log::info!(
+                                    "[claude-desktop] 全局长流并发上限=3，等待空位 {}ms",
+                                    queued_at.elapsed().as_millis()
+                                );
+                            }
+                            Some(permit)
+                        }
+                        Ok(Err(_)) => {
+                            last_error = Some(ProxyError::ForwardFailed(
+                                "Claude Desktop 全局并发控制器已关闭".to_string(),
+                            ));
+                            last_provider = Some(provider.clone());
+                            break;
+                        }
+                        Err(_) => {
+                            last_error = Some(ProxyError::Timeout(
+                                "Claude Desktop 全局长流并发等待超过本轮 45 秒预算".to_string(),
+                            ));
+                            last_provider = Some(provider.clone());
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
             // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
@@ -1189,6 +1488,34 @@ impl RequestForwarder {
                 } else {
                     body.clone()
                 };
+
+            match wait_for_claude_desktop_launch(
+                app_type,
+                provider,
+                self.router.as_ref(),
+                app_type_str,
+                retry_deadline,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.router
+                        .release_permit_neutral(&provider.id, app_type_str, circuit_permit.permit())
+                        .await;
+                    circuit_permit.disarm();
+                    continue;
+                }
+                Err(error) => {
+                    self.router
+                        .release_permit_neutral(&provider.id, app_type_str, circuit_permit.permit())
+                        .await;
+                    circuit_permit.disarm();
+                    last_error = Some(error);
+                    last_provider = Some(provider.clone());
+                    break;
+                }
+            }
 
             attempted_providers += 1;
 
@@ -1250,6 +1577,7 @@ impl RequestForwarder {
                         outbound_model,
                         connection_guard: None,
                         upstream_permit,
+                        global_upstream_permit,
                         stream_outcome,
                     });
                 }
@@ -1287,6 +1615,47 @@ impl RequestForwarder {
                                 super::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
                             );
 
+                            match wait_for_claude_desktop_launch(
+                                app_type,
+                                provider,
+                                self.router.as_ref(),
+                                app_type_str,
+                                retry_deadline,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    self.router
+                                        .release_permit_neutral(
+                                            &provider.id,
+                                            app_type_str,
+                                            circuit_permit.permit(),
+                                        )
+                                        .await;
+                                    circuit_permit.disarm();
+                                    last_error = Some(ProxyError::ProviderUnhealthy(format!(
+                                        "Provider {} entered rate-limit cooldown while queued",
+                                        provider.name
+                                    )));
+                                    last_provider = Some(provider.clone());
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.router
+                                        .release_permit_neutral(
+                                            &provider.id,
+                                            app_type_str,
+                                            circuit_permit.permit(),
+                                        )
+                                        .await;
+                                    circuit_permit.disarm();
+                                    return Err(ForwardError {
+                                        error,
+                                        provider: Some(provider.clone()),
+                                    });
+                                }
+                            }
                             match self
                                 .forward(
                                     app_type,
@@ -1337,6 +1706,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         connection_guard: None,
                                         upstream_permit,
+                                        global_upstream_permit,
                                         stream_outcome,
                                     });
                                 }
@@ -1350,6 +1720,7 @@ impl RequestForwarder {
                                             provider,
                                             app_type_str,
                                             &mut circuit_permit,
+                                            upstream_permit.as_ref(),
                                             "media 降级",
                                             &mut last_error,
                                             &mut last_provider,
@@ -1418,6 +1789,47 @@ impl RequestForwarder {
                                 let _ = std::mem::replace(&mut rectifier_retried, true);
 
                                 // 使用同一供应商重试（不计入熔断器）
+                                match wait_for_claude_desktop_launch(
+                                    app_type,
+                                    provider,
+                                    self.router.as_ref(),
+                                    app_type_str,
+                                    retry_deadline,
+                                )
+                                .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        self.router
+                                            .release_permit_neutral(
+                                                &provider.id,
+                                                app_type_str,
+                                                circuit_permit.permit(),
+                                            )
+                                            .await;
+                                        circuit_permit.disarm();
+                                        last_error = Some(ProxyError::ProviderUnhealthy(format!(
+                                            "Provider {} entered rate-limit cooldown while queued",
+                                            provider.name
+                                        )));
+                                        last_provider = Some(provider.clone());
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        self.router
+                                            .release_permit_neutral(
+                                                &provider.id,
+                                                app_type_str,
+                                                circuit_permit.permit(),
+                                            )
+                                            .await;
+                                        circuit_permit.disarm();
+                                        return Err(ForwardError {
+                                            error,
+                                            provider: Some(provider.clone()),
+                                        });
+                                    }
+                                }
                                 match self
                                     .forward(
                                         app_type,
@@ -1466,6 +1878,7 @@ impl RequestForwarder {
                                             outbound_model,
                                             connection_guard: None,
                                             upstream_permit,
+                                            global_upstream_permit,
                                             stream_outcome,
                                         });
                                     }
@@ -1479,6 +1892,7 @@ impl RequestForwarder {
                                                 provider,
                                                 app_type_str,
                                                 &mut circuit_permit,
+                                                upstream_permit.as_ref(),
                                                 "整流",
                                                 &mut last_error,
                                                 &mut last_provider,
@@ -1565,6 +1979,47 @@ impl RequestForwarder {
                             let _ = std::mem::replace(&mut budget_rectifier_retried, true);
 
                             // 使用同一供应商重试（不计入熔断器）
+                            match wait_for_claude_desktop_launch(
+                                app_type,
+                                provider,
+                                self.router.as_ref(),
+                                app_type_str,
+                                retry_deadline,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    self.router
+                                        .release_permit_neutral(
+                                            &provider.id,
+                                            app_type_str,
+                                            circuit_permit.permit(),
+                                        )
+                                        .await;
+                                    circuit_permit.disarm();
+                                    last_error = Some(ProxyError::ProviderUnhealthy(format!(
+                                        "Provider {} entered rate-limit cooldown while queued",
+                                        provider.name
+                                    )));
+                                    last_provider = Some(provider.clone());
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.router
+                                        .release_permit_neutral(
+                                            &provider.id,
+                                            app_type_str,
+                                            circuit_permit.permit(),
+                                        )
+                                        .await;
+                                    circuit_permit.disarm();
+                                    return Err(ForwardError {
+                                        error,
+                                        provider: Some(provider.clone()),
+                                    });
+                                }
+                            }
                             match self
                                 .forward(
                                     app_type,
@@ -1613,6 +2068,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         connection_guard: None,
                                         upstream_permit,
+                                        global_upstream_permit,
                                         stream_outcome,
                                     });
                                 }
@@ -1626,6 +2082,7 @@ impl RequestForwarder {
                                             provider,
                                             app_type_str,
                                             &mut circuit_permit,
+                                            upstream_permit.as_ref(),
                                             "budget 整流",
                                             &mut last_error,
                                             &mut last_provider,
@@ -1670,7 +2127,8 @@ impl RequestForwarder {
 
                     match category {
                         ErrorCategory::Retryable => {
-                            if is_rate_limit_error(&e) {
+                            let rate_limited = is_rate_limit_error(&e);
+                            if rate_limited {
                                 match self
                                     .router
                                     .mark_provider_rate_limited(&provider.id, app_type_str)
@@ -1687,6 +2145,10 @@ impl RequestForwarder {
                                         "[{app_type_str}] 记录供应商 {} 的速率限制冷却失败: {error}",
                                         provider.id
                                     ),
+                                }
+                            } else if app_type_str == AppType::ClaudeDesktop.as_str() {
+                                if let Some(permit) = upstream_permit.as_ref() {
+                                    permit.mark_failure();
                                 }
                             }
                             // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
@@ -3038,8 +3500,9 @@ impl RequestForwarder {
             let mut response = if claude_desktop_anthropic_stream {
                 // 不信任 Content-Type：部分兼容网关会把 SSE 错标为 JSON。验证器
                 // 同时识别完整 JSON 文档与 SSE，并在确认 SSE 后修正响应头。
-                // message_start / ping 仍处于可故障转移阶段；只有出现首个有效文本
-                // 或合法终止事件后才提交给 Claude。
+                // message_start / ping 仍处于可故障转移阶段；首个非空 text、
+                // thinking、tool JSON 或 signature delta 即提交给 Claude，避免长思考
+                // 被暂存到 256 KiB；未知/空 delta 继续保留早错故障转移窗口。
                 self.validate_anthropic_stream_start(response).await?
             } else {
                 self.prepare_success_response_for_failover(response, request_is_streaming)
@@ -3074,7 +3537,17 @@ impl RequestForwarder {
             // 自动解压 feature，这里拿到的是原始字节；不解压的话，压缩过的错误体会
             // 在 from_utf8 处变成非 UTF-8 而被丢弃，隐藏掉上游的限流/鉴权等详情。
             let encoding = get_content_encoding(response.headers());
-            let raw = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
+            let raw = match response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    return Err(ProxyError::UpstreamError {
+                        status: status_code,
+                        body: Some(format!(
+                            "上游返回 HTTP {status_code}，但错误响应体读取失败: {error}"
+                        )),
+                    });
+                }
+            };
             let decoded = match encoding {
                 Some(encoding) => {
                     match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
@@ -3599,6 +4072,13 @@ fn should_defer_claude_desktop_stream_outcome(
         || claude_api_format.is_some_and(super::providers::claude_api_format_needs_transform)
 }
 
+fn should_limit_claude_desktop_long_stream(
+    app_type: &AppType,
+    client_requested_stream: bool,
+) -> bool {
+    matches!(app_type, AppType::ClaudeDesktop) && client_requested_stream
+}
+
 fn effective_response_header_timeout(
     request_is_streaming: bool,
     streaming_first_byte_timeout: std::time::Duration,
@@ -3981,12 +4461,18 @@ fn inspect_anthropic_start_event(block: &str) -> Option<Result<(), ProxyError>> 
         "message_start" | "ping" | "content_block_start" | "content_block_stop" | "" => None,
         "content_block_delta" => {
             let delta_type = value.pointer("/delta/type").and_then(Value::as_str);
-            let has_text = delta_type == Some("text_delta")
-                && value
-                    .pointer("/delta/text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty());
-            has_text.then_some(Ok(()))
+            let payload_path = match delta_type {
+                Some("text_delta") => Some("/delta/text"),
+                Some("thinking_delta") => Some("/delta/thinking"),
+                Some("input_json_delta") => Some("/delta/partial_json"),
+                Some("signature_delta") => Some("/delta/signature"),
+                _ => None,
+            };
+            let has_semantic_delta = payload_path
+                .and_then(|path| value.pointer(path))
+                .and_then(Value::as_str)
+                .is_some_and(|payload| !payload.is_empty());
+            has_semantic_delta.then_some(Ok(()))
         }
         "message_delta" => value
             .pointer("/delta/stop_reason")
@@ -4723,14 +5209,14 @@ mod tests {
             "successes during cooldown must not reopen concurrency"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        for _ in 0..4 {
+        for _ in 0..8 {
             limiter.mark_success();
         }
         assert_eq!(limiter.current_limit(), 2);
         let fourth = tokio::time::timeout(Duration::from_secs(1), limiter.acquire())
             .await
             .expect("second slot should reopen additively after cooldown and successes");
-        for _ in 0..8 {
+        for _ in 0..16 {
             limiter.mark_success();
         }
         assert_eq!(limiter.current_limit(), 3);
@@ -4739,30 +5225,183 @@ mod tests {
     }
 
     #[test]
-    fn claude_desktop_limiter_expands_on_pressure_but_not_during_429_cooldown() {
+    fn claude_desktop_limiter_never_expands_from_queue_pressure() {
         let limiter = AdaptiveConcurrencyLimiter::new(1, 3);
         let first = limiter.try_acquire().expect("initial slot");
         assert!(limiter.try_acquire().is_none());
 
-        let second = limiter
-            .try_acquire_under_pressure(Duration::ZERO)
-            .expect("queue pressure should open one slot");
+        for _ in 0..7 {
+            limiter.mark_success();
+        }
+        assert_eq!(limiter.current_limit(), 1);
+        assert!(limiter.try_acquire().is_none());
+        limiter.mark_failure();
+        for _ in 0..7 {
+            limiter.mark_success();
+        }
+        assert_eq!(
+            limiter.current_limit(),
+            1,
+            "a failure must reset the complete-success streak"
+        );
+        limiter.mark_success();
         assert_eq!(limiter.current_limit(), 2);
+        let second = limiter
+            .try_acquire()
+            .expect("only complete successes may open the second slot");
 
         limiter.mark_rate_limited(Duration::from_secs(1));
         assert_eq!(limiter.current_limit(), 1);
-        assert!(
-            limiter.try_acquire_under_pressure(Duration::ZERO).is_none(),
-            "429 cooldown must suppress pressure-based expansion"
-        );
         drop(first);
         drop(second);
     }
 
+    #[tokio::test]
+    async fn claude_desktop_launch_gate_serializes_request_starts() {
+        let gate = AdaptiveLaunchGate::new();
+        gate.state.lock().expect("gate state").interval_ms = 20;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        gate.wait_turn(deadline, || async { true })
+            .await
+            .expect("first launch")
+            .expect("first granted");
+        let waited = gate
+            .wait_turn(deadline, || async { true })
+            .await
+            .expect("second launch")
+            .expect("second granted");
+        assert!(
+            waited >= Duration::from_millis(15),
+            "second launch must be globally spaced, waited={:?}",
+            waited
+        );
+    }
+
+    #[test]
+    fn claude_desktop_launch_gate_recovers_only_after_cooldown_and_successes() {
+        let gate = AdaptiveLaunchGate::new();
+        gate.mark_rate_limited(Duration::from_secs(30));
+        assert_eq!(
+            gate.current_interval_ms(),
+            AdaptiveLaunchGate::CONGESTED_INTERVAL_MS
+        );
+        for _ in 0..AdaptiveLaunchGate::SUCCESSES_PER_RECOVERY_STEP {
+            gate.mark_success();
+        }
+        assert_eq!(
+            gate.current_interval_ms(),
+            AdaptiveLaunchGate::CONGESTED_INTERVAL_MS,
+            "successes during cooldown must not restore launch rate"
+        );
+
+        gate.state.lock().expect("gate state").congestion_until =
+            Some(std::time::Instant::now() - Duration::from_millis(1));
+        for _ in 0..4 {
+            gate.mark_success();
+        }
+        gate.mark_failure();
+        for _ in 0..4 {
+            gate.mark_success();
+        }
+        assert_eq!(
+            gate.current_interval_ms(),
+            AdaptiveLaunchGate::CONGESTED_INTERVAL_MS,
+            "a failure must reset launch-rate recovery streak"
+        );
+        for _ in 0..AdaptiveLaunchGate::SUCCESSES_PER_RECOVERY_STEP {
+            gate.mark_success();
+        }
+        assert_eq!(gate.current_interval_ms(), 1_750);
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_launch_gate_respects_retry_deadline() {
+        let gate = AdaptiveLaunchGate::new();
+        gate.state.lock().expect("gate state").interval_ms = 2_000;
+        gate.wait_turn(
+            std::time::Instant::now() + Duration::from_secs(1),
+            || async { true },
+        )
+        .await
+        .expect("first launch");
+        let result = gate
+            .wait_turn(
+                std::time::Instant::now() + Duration::from_millis(20),
+                || async { true },
+            )
+            .await;
+        assert!(matches!(result, Err(ProxyError::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_launch_gate_skips_stale_turn_before_commit() {
+        let gate = AdaptiveLaunchGate::new();
+        gate.state.lock().expect("gate state").interval_ms = 100;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        gate.wait_turn(deadline, || async { true })
+            .await
+            .expect("initial turn")
+            .expect("initial granted");
+        let (stale, next) = tokio::join!(
+            gate.wait_turn(deadline, || async { false }),
+            gate.wait_turn(deadline, || async { true }),
+        );
+        assert!(stale.expect("stale result").is_none());
+        let next = next
+            .expect("replacement result")
+            .expect("replacement granted");
+        assert!(
+            next < Duration::from_millis(170),
+            "stale cooldown candidate must not add a second interval: {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_launch_gate_timestamps_after_validation() {
+        let gate = AdaptiveLaunchGate::new();
+        gate.state.lock().expect("gate state").interval_ms = 100;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        gate.wait_turn(deadline, || async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            true
+        })
+        .await
+        .expect("validated turn")
+        .expect("turn granted");
+        let second = gate
+            .wait_turn(deadline, || async { true })
+            .await
+            .expect("second turn")
+            .expect("second granted");
+        assert!(
+            second >= Duration::from_millis(90),
+            "launch spacing must start after validation commit, waited={second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_global_long_stream_limit_is_three() {
+        let limiter = Arc::new(Semaphore::new(3));
+        let first = limiter.clone().acquire_owned().await.unwrap();
+        let second = limiter.clone().acquire_owned().await.unwrap();
+        let third = limiter.clone().acquire_owned().await.unwrap();
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(20), limiter.clone().acquire_owned()).await;
+        assert!(blocked.is_err(), "a fourth long stream must wait");
+        drop(first);
+        let fourth = tokio::time::timeout(Duration::from_secs(1), limiter.clone().acquire_owned())
+            .await
+            .expect("released global slot")
+            .unwrap();
+        drop(second);
+        drop(third);
+        drop(fourth);
+    }
+
     #[test]
     fn claude_desktop_capacity_isolated_per_provider() {
-        let first_provider = claude_desktop_upstream_limiter("test-capacity-provider-a");
-        let second_provider = claude_desktop_upstream_limiter("test-capacity-provider-b");
+        let first_provider = claude_desktop_upstream_limiter("test-capacity-provider-a", 1);
+        let second_provider = claude_desktop_upstream_limiter("test-capacity-provider-b", 1);
         let first = first_provider.try_acquire().expect("provider A slot");
         assert!(
             first_provider.try_acquire().is_none(),
@@ -4773,6 +5412,57 @@ mod tests {
             .expect("provider B must remain independently available");
         drop(first);
         drop(second);
+    }
+
+    #[test]
+    fn claude_desktop_runtime_reset_preserves_inflight_count() {
+        let limiter = AdaptiveConcurrencyLimiter::new(1, 2);
+        for _ in 0..8 {
+            limiter.mark_success();
+        }
+        assert_eq!(limiter.current_limit(), 2);
+        let first = limiter.try_acquire().expect("first in-flight");
+        let second = limiter.try_acquire().expect("second in-flight");
+        limiter.reset_runtime(1);
+        assert_eq!(limiter.current_limit(), 1);
+        assert!(limiter.try_acquire().is_none());
+
+        drop(first);
+        assert!(
+            limiter.try_acquire().is_none(),
+            "one old in-flight request must still fill the reset limit"
+        );
+        drop(second);
+        let next = limiter
+            .try_acquire()
+            .expect("new request may start only after old active count reaches zero");
+        drop(next);
+    }
+
+    #[test]
+    fn claude_desktop_single_provider_starts_and_resets_at_two() {
+        let limiter = AdaptiveConcurrencyLimiter::new(2, 2);
+        assert_eq!(limiter.current_limit(), 2);
+        limiter.mark_rate_limited(Duration::from_secs(30));
+        assert_eq!(limiter.current_limit(), 1);
+        limiter.reset_runtime(2);
+        assert_eq!(limiter.current_limit(), 2);
+    }
+
+    #[test]
+    fn claude_desktop_mode_change_updates_baseline_without_losing_active() {
+        let limiter = AdaptiveConcurrencyLimiter::new(1, 2);
+        limiter.update_mode_initial_limit(2);
+        assert_eq!(limiter.current_limit(), 2);
+        let first = limiter.try_acquire().unwrap();
+        let second = limiter.try_acquire().unwrap();
+
+        limiter.update_mode_initial_limit(1);
+        assert_eq!(limiter.current_limit(), 1);
+        drop(first);
+        assert!(limiter.try_acquire().is_none());
+        drop(second);
+        assert!(limiter.try_acquire().is_some());
     }
 
     #[tokio::test]
@@ -4920,6 +5610,18 @@ mod tests {
             true,
             &response,
             Some("anthropic"),
+        ));
+        assert!(should_limit_claude_desktop_long_stream(
+            &AppType::ClaudeDesktop,
+            true,
+        ));
+        assert!(!should_limit_claude_desktop_long_stream(
+            &AppType::ClaudeDesktop,
+            false,
+        ));
+        assert!(!should_limit_claude_desktop_long_stream(
+            &AppType::Claude,
+            true,
         ));
     }
 
@@ -5692,6 +6394,30 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
         );
         assert!(matches!(inspect_anthropic_start_event(delta), Some(Ok(()))));
+
+        let thinking = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reasoning\"}}"
+        );
+        assert!(matches!(
+            inspect_anthropic_start_event(thinking),
+            Some(Ok(()))
+        ));
+
+        let tool_json = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}"
+        );
+        assert!(matches!(
+            inspect_anthropic_start_event(tool_json),
+            Some(Ok(()))
+        ));
+
+        let unknown = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"vendor_delta\",\"payload\":true}}"
+        );
+        assert!(inspect_anthropic_start_event(unknown).is_none());
     }
 
     #[test]

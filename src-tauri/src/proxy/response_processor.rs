@@ -1374,7 +1374,7 @@ pub fn create_logged_passthrough_stream(
                                         }
                                         let suppress_midstream_error = descriptor.event_type
                                             == "error"
-                                            && anthropic_state.saw_text_delta;
+                                            && anthropic_state.saw_message_start;
                                         if suppress_midstream_error {
                                             let mut error_state = AnthropicTerminalState::default();
                                             observe_anthropic_sse_block(
@@ -1391,6 +1391,14 @@ pub fn create_logged_passthrough_stream(
                                                 }),
                                             ));
                                             rewrote_incomplete_content = true;
+                                            if !anthropic_state.saw_text_delta {
+                                                completed_anthropic_blocks.extend(
+                                                    ensure_anthropic_recovery_text(
+                                                        &mut anthropic_state,
+                                                        "CC Switch 已接管上游流错误并保留当前进度，将以可继续状态结束本轮。",
+                                                    ),
+                                                );
+                                            }
                                             for terminal in anthropic_terminal_chunks(
                                                 &anthropic_state,
                                                 "stream_error",
@@ -2163,6 +2171,39 @@ mod tests {
             });
         let text = String::from_utf8(text).unwrap();
         assert!(text.contains("partial answer"), "{text}");
+        assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_error_after_thinking_becomes_continuable_turn() {
+        let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reasoning\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Please retry later\"}}\n\n",
+        ))]);
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::ClaudeDesktopAnthropic,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("reasoning"), "{text}");
+        assert!(text.contains("已安全取消该块"), "{text}");
         assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
         assert!(text.contains("event: message_stop"), "{text}");
         assert!(!text.contains("event: error"), "{text}");

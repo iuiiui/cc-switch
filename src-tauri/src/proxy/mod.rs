@@ -42,6 +42,7 @@ pub use circuit_breaker::{
 };
 #[allow(unused_imports)]
 pub use error::ProxyError;
+pub(crate) use forwarder::reset_claude_desktop_adaptive_runtime;
 #[allow(unused_imports)]
 pub use provider_router::ProviderRouter;
 #[allow(unused_imports)]
