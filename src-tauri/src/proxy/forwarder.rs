@@ -781,13 +781,6 @@ fn claude_desktop_global_concurrency() -> Arc<Semaphore> {
     GLOBAL.get_or_init(|| Arc::new(Semaphore::new(3))).clone()
 }
 
-fn claude_desktop_poll_concurrency() -> Arc<Semaphore> {
-    static GLOBAL: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    // Desktop 的 max_tokens=1/2 内部探测只允许单路执行，避免多 agent 把探测
-    // 自身放大成 pending-request 风暴；它与正式长流使用不同队列，不再阻塞任务。
-    GLOBAL.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
-}
-
 fn claude_desktop_launch_gate() -> Arc<AdaptiveLaunchGate> {
     static GATE: OnceLock<Arc<AdaptiveLaunchGate>> = OnceLock::new();
     GATE.get_or_init(AdaptiveLaunchGate::new).clone()
@@ -1280,12 +1273,11 @@ impl RequestForwarder {
         // 先进入请求级全局队列，再占用任一 Provider 的 AIMD 窗口。旧顺序会让
         // 等待全局长流空位的请求提前锁住 Provider，最终形成“全局在等流、其它
         // 请求又等 Provider”的容量倒置。队列不设本地 45 秒取消；客户端断开会
-        // 直接取消此 future。正式长流和内部短轮询分队列，轮询不会再饿死任务。
+        // 直接取消此 future。只有正式长流进入全局生命周期队列；内部短轮询仅走
+        // 独立启动闸门与 per-Provider AIMD，不再在全局单路队列里相互等待数分钟。
         let global_queue = if matches!(app_type, AppType::ClaudeDesktop) {
             if should_limit_claude_desktop_long_stream(app_type, client_requested_stream) {
                 Some((claude_desktop_global_concurrency(), "正式长流", 3usize))
-            } else if internal_poll {
-                Some((claude_desktop_poll_concurrency(), "内部轮询", 1usize))
             } else {
                 None
             }
@@ -5375,25 +5367,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_desktop_long_stream_and_poll_queues_are_isolated() {
+    async fn claude_desktop_global_long_stream_limit_is_three() {
         let long_queue = claude_desktop_global_concurrency();
-        let poll_queue = claude_desktop_poll_concurrency();
         let first = long_queue.clone().acquire_owned().await.unwrap();
         let second = long_queue.clone().acquire_owned().await.unwrap();
         let third = long_queue.clone().acquire_owned().await.unwrap();
-        let poll = poll_queue.clone().acquire_owned().await.unwrap();
         let blocked = tokio::time::timeout(
             Duration::from_millis(20),
             long_queue.clone().acquire_owned(),
         )
         .await;
         assert!(blocked.is_err(), "a fourth long stream must wait");
-        let second_poll = tokio::time::timeout(
-            Duration::from_millis(20),
-            poll_queue.clone().acquire_owned(),
-        )
-        .await;
-        assert!(second_poll.is_err(), "internal polls must be serialized");
         drop(first);
         let fourth =
             tokio::time::timeout(Duration::from_secs(1), long_queue.clone().acquire_owned())
@@ -5403,7 +5387,6 @@ mod tests {
         drop(second);
         drop(third);
         drop(fourth);
-        drop(poll);
     }
 
     #[test]
