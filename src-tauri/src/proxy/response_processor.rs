@@ -20,7 +20,7 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -198,7 +198,9 @@ pub async fn handle_streaming(
         usage_collector,
         timeout_config,
         connection_guard,
-        if matches!(ctx.app_type_str, "claude" | "claude-desktop") {
+        if ctx.app_type_str == "claude-desktop" {
+            SseTerminalPolicy::ClaudeDesktopAnthropic
+        } else if ctx.app_type_str == "claude" {
             SseTerminalPolicy::AnthropicMessages
         } else {
             SseTerminalPolicy::Passthrough
@@ -716,6 +718,17 @@ async fn log_usage_internal(
 pub enum SseTerminalPolicy {
     Passthrough,
     AnthropicMessages,
+    ClaudeDesktopAnthropic,
+}
+
+impl SseTerminalPolicy {
+    fn is_anthropic(self) -> bool {
+        matches!(self, Self::AnthropicMessages | Self::ClaudeDesktopAnthropic)
+    }
+
+    fn is_claude_desktop(self) -> bool {
+        self == Self::ClaudeDesktopAnthropic
+    }
 }
 
 #[derive(Default)]
@@ -726,7 +739,10 @@ struct AnthropicTerminalState {
     saw_error: bool,
     error_status: Option<u16>,
     error_message: Option<String>,
-    open_content_blocks: HashSet<u64>,
+    open_content_blocks: HashMap<u64, String>,
+    saw_text_block: bool,
+    saw_text_delta: bool,
+    saw_non_text_block: bool,
 }
 
 fn observe_anthropic_sse_block(block: &str, state: &mut AnthropicTerminalState) {
@@ -754,7 +770,18 @@ fn observe_anthropic_sse_block(block: &str, state: &mut AnthropicTerminalState) 
                 .and_then(|value| value.get("index"))
                 .and_then(Value::as_u64)
             {
-                state.open_content_blocks.insert(index);
+                let block_type = parsed
+                    .as_ref()
+                    .and_then(|value| value.pointer("/content_block/type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                if block_type == "text" {
+                    state.saw_text_block = true;
+                } else {
+                    state.saw_non_text_block = true;
+                }
+                state.open_content_blocks.insert(index, block_type);
             }
         }
         Some("content_block_stop") => {
@@ -765,6 +792,19 @@ fn observe_anthropic_sse_block(block: &str, state: &mut AnthropicTerminalState) 
             {
                 state.open_content_blocks.remove(&index);
             }
+        }
+        Some("content_block_delta") => {
+            let has_text_delta = parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/delta/type"))
+                .and_then(Value::as_str)
+                == Some("text_delta")
+                && parsed
+                    .as_ref()
+                    .and_then(|value| value.pointer("/delta/text"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty());
+            state.saw_text_delta |= has_text_delta;
         }
         Some("message_delta") => {
             state.saw_final_message_delta = parsed
@@ -806,24 +846,60 @@ fn anthropic_can_complete_safely(state: &AnthropicTerminalState) -> bool {
         && !state.saw_error
 }
 
-fn anthropic_terminal_bytes(
+fn anthropic_can_repair_truncated_text(state: &AnthropicTerminalState) -> bool {
+    state.saw_message_start
+        && state.saw_text_block
+        && state.saw_text_delta
+        && !state.saw_non_text_block
+        && !state.saw_error
+        && state
+            .open_content_blocks
+            .values()
+            .all(|block_type| block_type == "text")
+}
+
+fn anthropic_terminal_chunks(
     state: &AnthropicTerminalState,
     error_type: &str,
     message: &str,
-) -> Option<Bytes> {
+    allow_text_repair: bool,
+) -> Vec<Bytes> {
     if state.saw_message_stop || state.saw_error {
-        return None;
+        return Vec::new();
     }
     if anthropic_can_complete_safely(state) {
-        return Some(Bytes::from_static(
+        return vec![Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )];
+    }
+    if allow_text_repair && anthropic_can_repair_truncated_text(state) {
+        let mut chunks = state
+            .open_content_blocks
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        chunks.sort_unstable();
+        let mut repaired = chunks
+            .into_iter()
+            .map(|index| {
+                Bytes::from(format!(
+                    "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}\n\n"
+                ))
+            })
+            .collect::<Vec<_>>();
+        repaired.push(Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n",
+        ));
+        repaired.push(Bytes::from_static(
             b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         ));
+        return repaired;
     }
     let payload = serde_json::json!({
         "type": "error",
         "error": { "type": error_type, "message": message }
     });
-    Some(Bytes::from(format!("event: error\ndata: {}\n\n", payload)))
+    vec![Bytes::from(format!("event: error\ndata: {}\n\n", payload))]
 }
 
 pub fn create_logged_passthrough_stream(
@@ -843,7 +919,7 @@ pub fn create_logged_passthrough_stream(
         let inspect_sse_events =
             collector.is_some()
                 || log::log_enabled!(log::Level::Debug)
-                || terminal_policy == SseTerminalPolicy::AnthropicMessages;
+                || terminal_policy.is_anthropic();
         let mut anthropic_state = AnthropicTerminalState::default();
         let mut is_first_chunk = true;
 
@@ -878,7 +954,7 @@ pub fn create_logged_passthrough_stream(
                             // 超时
                             let timeout_type = if is_first_chunk { "首字节" } else { "静默期" };
                             log::error!("[{tag}] 流式响应{}超时 ({}秒)", timeout_type, duration.as_secs());
-                            if terminal_policy != SseTerminalPolicy::AnthropicMessages
+                            if !terminal_policy.is_anthropic()
                                 || !anthropic_can_complete_safely(&anthropic_state)
                             {
                                 if let Some(c) = &collector {
@@ -889,16 +965,17 @@ pub fn create_logged_passthrough_stream(
                                     .await;
                                 }
                             }
-                            if terminal_policy == SseTerminalPolicy::AnthropicMessages {
+                            if terminal_policy.is_anthropic() {
                                 if !buffer.trim().is_empty() {
                                     observe_anthropic_sse_block(&buffer, &mut anthropic_state);
                                     buffer.clear();
                                     yield Ok(Bytes::from_static(b"\n\n"));
                                 }
-                                if let Some(terminal) = anthropic_terminal_bytes(
+                                for terminal in anthropic_terminal_chunks(
                                     &anthropic_state,
                                     "stream_timeout",
                                     &format!("Upstream stream was idle for {} seconds", duration.as_secs()),
+                                    false,
                                 ) {
                                     yield Ok(terminal);
                                 }
@@ -927,7 +1004,7 @@ pub fn create_logged_passthrough_stream(
                         // 尝试解析并记录完整的 SSE 事件
                         while let Some(event_text) = take_sse_block(&mut buffer) {
                             if !event_text.trim().is_empty() {
-                                if terminal_policy == SseTerminalPolicy::AnthropicMessages {
+                                if terminal_policy.is_anthropic() {
                                     observe_anthropic_sse_block(&event_text, &mut anthropic_state);
                                 }
                                 // 提取 data 部分；只有 usage collector 存在时才解析 JSON。
@@ -961,6 +1038,14 @@ pub fn create_logged_passthrough_stream(
 
                     yield Ok(bytes);
                     if anthropic_state.saw_error {
+                        if terminal_policy.is_claude_desktop() {
+                            crate::proxy::forwarder::note_claude_desktop_stream_error(
+                                anthropic_state
+                                    .error_message
+                                    .as_deref()
+                                    .unwrap_or("Upstream stream returned an error event"),
+                            );
+                        }
                         if let Some(c) = &collector {
                             c.set_terminal_failure(
                                 anthropic_state.error_status.unwrap_or(502),
@@ -972,15 +1057,20 @@ pub fn create_logged_passthrough_stream(
                             .await;
                         }
                     }
-                    if terminal_policy == SseTerminalPolicy::AnthropicMessages
+                    if terminal_policy.is_anthropic()
                         && (anthropic_state.saw_message_stop || anthropic_state.saw_error)
                     {
+                        if terminal_policy.is_claude_desktop()
+                            && anthropic_state.saw_message_stop
+                        {
+                            crate::proxy::forwarder::mark_claude_desktop_stream_success();
+                        }
                         break;
                     }
                 }
                 Some(Err(e)) => {
                     log::error!("[{tag}] 流错误: {e}");
-                    if terminal_policy != SseTerminalPolicy::AnthropicMessages
+                    if !terminal_policy.is_anthropic()
                         || !anthropic_can_complete_safely(&anthropic_state)
                     {
                         if let Some(c) = &collector {
@@ -988,16 +1078,17 @@ pub fn create_logged_passthrough_stream(
                                 .await;
                         }
                     }
-                    if terminal_policy == SseTerminalPolicy::AnthropicMessages {
+                    if terminal_policy.is_anthropic() {
                         if !buffer.trim().is_empty() {
                             observe_anthropic_sse_block(&buffer, &mut anthropic_state);
                             buffer.clear();
                             yield Ok(Bytes::from_static(b"\n\n"));
                         }
-                        if let Some(terminal) = anthropic_terminal_bytes(
+                        for terminal in anthropic_terminal_chunks(
                             &anthropic_state,
                             "stream_error",
                             "Upstream stream ended with an I/O error",
+                            false,
                         ) {
                             yield Ok(terminal);
                         }
@@ -1007,26 +1098,33 @@ pub fn create_logged_passthrough_stream(
                     break;
                 }
                 None => {
-                    if terminal_policy == SseTerminalPolicy::AnthropicMessages {
+                    if terminal_policy.is_anthropic() {
                         if !buffer.trim().is_empty() {
                             observe_anthropic_sse_block(&buffer, &mut anthropic_state);
                             buffer.clear();
                             yield Ok(Bytes::from_static(b"\n\n"));
                         }
-                        if let Some(terminal) = anthropic_terminal_bytes(
+                        let terminals = anthropic_terminal_chunks(
                             &anthropic_state,
                             "stream_truncated",
                             "Upstream stream ended before message_stop",
-                        ) {
-                            if !anthropic_can_complete_safely(&anthropic_state) {
-                                if let Some(c) = &collector {
-                                    c.set_terminal_failure(
-                                        502,
-                                        "Upstream stream ended before message_stop",
-                                    )
-                                    .await;
-                                }
+                            true,
+                        );
+                        if terminal_policy.is_claude_desktop()
+                            && anthropic_can_complete_safely(&anthropic_state)
+                        {
+                            crate::proxy::forwarder::mark_claude_desktop_stream_success();
+                        }
+                        if !anthropic_can_complete_safely(&anthropic_state) {
+                            if let Some(c) = &collector {
+                                c.set_terminal_failure(
+                                    502,
+                                    "Upstream stream ended before message_stop",
+                                )
+                                .await;
                             }
+                        }
+                        for terminal in terminals {
                             yield Ok(terminal);
                         }
                     }
@@ -1252,6 +1350,102 @@ mod tests {
         let text = String::from_utf8(text).unwrap();
         assert!(text.contains("event: error"), "{text}");
         assert!(text.contains("stream_error"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_truncated_pure_text_is_closed_with_max_tokens() {
+        let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        ))]);
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::AnthropicMessages,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(output.iter().all(Result::is_ok));
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("event: content_block_stop"), "{text}");
+        assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_text_start_without_delta_is_not_repaired_as_success() {
+        let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        ))]);
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::AnthropicMessages,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(!text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_text_io_error_remains_an_error() {
+        let source = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+            )),
+            Err(std::io::Error::other("connection reset")),
+        ]);
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::AnthropicMessages,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("stream_error"), "{text}");
+        assert!(!text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
     }
 
     #[test]

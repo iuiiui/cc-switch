@@ -527,7 +527,11 @@ async fn handle_claude_transform(
             usage_collector,
             timeout_config,
             connection_guard,
-            SseTerminalPolicy::AnthropicMessages,
+            if ctx.app_type_str == "claude-desktop" {
+                SseTerminalPolicy::ClaudeDesktopAnthropic
+            } else {
+                SseTerminalPolicy::AnthropicMessages
+            },
         );
 
         let mut headers = axum::http::HeaderMap::new();

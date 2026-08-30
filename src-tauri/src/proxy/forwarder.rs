@@ -16,7 +16,6 @@ use super::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
         AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
     },
-    sse::{append_utf8_safe, strip_sse_field, take_sse_block},
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
@@ -112,6 +111,7 @@ pub struct ForwardResult {
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
+    upstream_permit: Option<AdaptiveConcurrencyPermit>,
 }
 
 pub struct ForwardError {
@@ -304,42 +304,19 @@ impl Drop for AdaptiveConcurrencyPermit {
 }
 
 impl ActiveConnectionGuard {
-    pub(crate) async fn acquire(
-        status: Arc<RwLock<ProxyStatus>>,
-        serialize_claude_desktop: bool,
-    ) -> Self {
-        let limiter = serialize_claude_desktop.then(claude_desktop_upstream_limiter);
-        Self::acquire_with_limiter(status, limiter).await
-    }
-
-    async fn acquire_with_limiter(
-        status: Arc<RwLock<ProxyStatus>>,
-        limiter: Option<Arc<AdaptiveConcurrencyLimiter>>,
-    ) -> Self {
-        let queued_at = std::time::Instant::now();
-        let upstream_permit = match limiter {
-            Some(limiter) => Some(limiter.acquire().await),
-            None => None,
-        };
-        if upstream_permit.is_some() && queued_at.elapsed() >= std::time::Duration::from_millis(10)
-        {
-            log::info!(
-                "[claude-desktop] 上游并发队列等待 {}ms（当前并发上限={}）",
-                queued_at.elapsed().as_millis(),
-                upstream_permit
-                    .as_ref()
-                    .map(|permit| permit.acquired_limit)
-                    .unwrap_or(0)
-            );
-        }
+    pub(crate) async fn acquire(status: Arc<RwLock<ProxyStatus>>) -> Self {
         {
             let mut s = status.write().await;
             s.active_connections = s.active_connections.saturating_add(1);
         }
         Self {
             status,
-            _upstream_permit: upstream_permit,
+            _upstream_permit: None,
         }
+    }
+
+    fn attach_upstream_permit(&mut self, permit: Option<AdaptiveConcurrencyPermit>) {
+        self._upstream_permit = permit;
     }
 }
 
@@ -348,6 +325,16 @@ fn claude_desktop_upstream_limiter() -> Arc<AdaptiveConcurrencyLimiter> {
     LIMITER
         .get_or_init(|| AdaptiveConcurrencyLimiter::new(2, 4))
         .clone()
+}
+
+pub(crate) fn mark_claude_desktop_stream_success() {
+    claude_desktop_upstream_limiter().mark_success();
+}
+
+pub(crate) fn note_claude_desktop_stream_error(message: &str) {
+    if text_has_rate_limit_signal(&message.to_ascii_lowercase()) {
+        claude_desktop_upstream_limiter().mark_rate_limited(std::time::Duration::from_secs(30));
+    }
 }
 
 impl Drop for ActiveConnectionGuard {
@@ -391,7 +378,6 @@ pub struct RequestForwarder {
     non_streaming_timeout: std::time::Duration,
     /// 流式请求响应头等待超时（秒）
     streaming_first_byte_timeout: std::time::Duration,
-    streaming_idle_timeout: std::time::Duration,
     /// 单个客户端请求最多尝试的 provider 数。
     ///
     /// 由 `AppProxyConfig.max_retries` (UI: "请求失败时的重试次数, 0-10") 派生：
@@ -460,7 +446,7 @@ impl RequestForwarder {
         session_id: String,
         session_client_provided: bool,
         streaming_first_byte_timeout: u64,
-        streaming_idle_timeout: u64,
+        _streaming_idle_timeout: u64,
         rectifier_config: RectifierConfig,
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
@@ -487,84 +473,7 @@ impl RequestForwarder {
             streaming_first_byte_timeout: std::time::Duration::from_secs(
                 streaming_first_byte_timeout,
             ),
-            streaming_idle_timeout: std::time::Duration::from_secs(streaming_idle_timeout),
             max_attempts,
-        }
-    }
-
-    async fn buffer_complete_anthropic_stream(
-        &self,
-        response: ProxyResponse,
-    ) -> Result<ProxyResponse, ProxyError> {
-        let status = response.status();
-        let headers = response.headers().clone();
-        let mut stream = Box::pin(response.bytes_stream());
-        let mut body = Vec::new();
-        let mut sse_buffer = String::new();
-        let mut utf8_remainder = Vec::new();
-
-        loop {
-            let next = if self.streaming_idle_timeout.is_zero() {
-                stream.next().await
-            } else {
-                match tokio::time::timeout(self.streaming_idle_timeout, stream.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        return Err(ProxyError::ForwardFailed(format!(
-                            "Upstream stream was idle for {} seconds before message_stop",
-                            self.streaming_idle_timeout.as_secs()
-                        )));
-                    }
-                }
-            };
-
-            let Some(chunk) = next else {
-                return Err(ProxyError::ForwardFailed(
-                    "Upstream stream ended before message_stop".to_string(),
-                ));
-            };
-            let chunk = chunk.map_err(|error| {
-                ProxyError::ForwardFailed(format!("Upstream stream I/O error: {error}"))
-            })?;
-            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
-                return Err(ProxyError::ResponseBodyTooLarge(
-                    body.len().saturating_add(chunk.len()),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-            append_utf8_safe(&mut sse_buffer, &mut utf8_remainder, &chunk);
-
-            while let Some(block) = take_sse_block(&mut sse_buffer) {
-                let named_event = block
-                    .lines()
-                    .find_map(|line| strip_sse_field(line, "event"))
-                    .map(str::trim);
-                let data = block
-                    .lines()
-                    .filter_map(|line| strip_sse_field(line, "data"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let parsed = serde_json::from_str::<Value>(&data).ok();
-                let event_type = parsed
-                    .as_ref()
-                    .and_then(|value| value.get("type"))
-                    .and_then(Value::as_str)
-                    .or(named_event);
-                match event_type {
-                    Some("message_stop") => {
-                        return Ok(ProxyResponse::buffered(status, headers, Bytes::from(body)));
-                    }
-                    Some("error") => {
-                        let message = parsed
-                            .as_ref()
-                            .and_then(|value| value.pointer("/error/message"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("Upstream stream returned an error event");
-                        return Err(ProxyError::ForwardFailed(message.to_string()));
-                    }
-                    _ => {}
-                }
-            }
         }
     }
 
@@ -580,10 +489,16 @@ impl RequestForwarder {
         }
     }
 
-    async fn finish_success(&self, provider: &Provider, app_type: &str, permit: AllowResult) {
+    async fn finish_success(
+        &self,
+        provider: &Provider,
+        app_type: &str,
+        permit: AllowResult,
+        mark_aimd_success: bool,
+    ) {
         self.record_success_result(&provider.id, app_type, permit)
             .await;
-        if app_type == AppType::ClaudeDesktop.as_str() {
+        if mark_aimd_success && app_type == AppType::ClaudeDesktop.as_str() {
             claude_desktop_upstream_limiter().mark_success();
         }
 
@@ -713,11 +628,7 @@ impl RequestForwarder {
         extensions: Extensions,
         providers: Vec<Provider>,
     ) -> Result<ForwardResult, ForwardError> {
-        let guard = ActiveConnectionGuard::acquire(
-            self.status.clone(),
-            matches!(app_type, AppType::ClaudeDesktop),
-        )
-        .await;
+        let mut guard = ActiveConnectionGuard::acquire(self.status.clone()).await;
         {
             let mut s = self.status.write().await;
             s.total_requests = s.total_requests.saturating_add(1);
@@ -731,10 +642,14 @@ impl RequestForwarder {
         // 把 guard 注入到 Ok 结果，让它随响应一起流转到 response_processor，
         // 在流式 body 的 future 内才真正 drop。
         // Err 路径：guard 在函数 scope 内随返回值落地时自动 drop。
-        result.map(|mut fr| {
-            fr.connection_guard = Some(guard);
-            fr
-        })
+        match result {
+            Ok(mut fr) => {
+                guard.attach_upstream_permit(fr.upstream_permit.take());
+                fr.connection_guard = Some(guard);
+                Ok(fr)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// 实际转发逻辑（不包含客户端维度的入口/出口计数）
@@ -882,6 +797,24 @@ impl RequestForwarder {
                     body.clone()
                 };
 
+            // AIMD 许可只覆盖真正的上游 attempt。Provider cooldown、候选选择和
+            // 请求前处理均不占槽；失败路径在本轮结束时立即释放，成功流则随
+            // ForwardResult 移交给下游生命周期 guard。
+            let upstream_permit = if matches!(app_type, AppType::ClaudeDesktop) {
+                let queued_at = std::time::Instant::now();
+                let permit = claude_desktop_upstream_limiter().acquire().await;
+                if queued_at.elapsed() >= std::time::Duration::from_millis(10) {
+                    log::info!(
+                        "[claude-desktop] 上游 attempt 排队 {}ms（当前并发上限={}）",
+                        queued_at.elapsed().as_millis(),
+                        permit.acquired_limit
+                    );
+                }
+                Some(permit)
+            } else {
+                None
+            };
+
             attempted_providers += 1;
 
             // 更新状态中的当前 Provider 信息（per-attempt 维度的标识）
@@ -910,45 +843,9 @@ impl RequestForwarder {
                 .await
             {
                 Ok((response, claude_api_format, outbound_model)) => {
-                    let strict_desktop_stream = matches!(app_type, AppType::ClaudeDesktop)
-                        && self.max_attempts > 1
-                        && body.get("stream").and_then(Value::as_bool) == Some(true)
-                        && matches!(claude_api_format.as_deref(), None | Some("anthropic"));
-                    let response = if strict_desktop_stream {
-                        match self.buffer_complete_anthropic_stream(response).await {
-                            Ok(response) => response,
-                            Err(stream_error) => {
-                                let _ = self
-                                    .router
-                                    .record_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        permit,
-                                        false,
-                                        Some(stream_error.to_string()),
-                                    )
-                                    .await;
-                                {
-                                    let mut status = self.status.write().await;
-                                    status.last_error = Some(format!(
-                                        "Provider {} 流不完整: {}",
-                                        provider.name, stream_error
-                                    ));
-                                }
-                                log::warn!(
-                                    "[{app_type_str}] [FWD-STREAM] Provider {} 流不完整，未向 Claude 提交并继续下一家: {}",
-                                    provider.name,
-                                    stream_error
-                                );
-                                last_error = Some(stream_error);
-                                last_provider = Some(provider.clone());
-                                continue;
-                            }
-                        }
-                    } else {
-                        response
-                    };
-                    self.finish_success(provider, app_type_str, permit).await;
+                    let mark_aimd_success = !response.is_sse();
+                    self.finish_success(provider, app_type_str, permit, mark_aimd_success)
+                        .await;
 
                     return Ok(ForwardResult {
                         response,
@@ -956,6 +853,7 @@ impl RequestForwarder {
                         claude_api_format,
                         outbound_model,
                         connection_guard: None,
+                        upstream_permit,
                     });
                 }
                 Err(e) => {
@@ -1009,7 +907,14 @@ impl RequestForwarder {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
-                                    self.finish_success(provider, app_type_str, permit).await;
+                                    let mark_aimd_success = !response.is_sse();
+                                    self.finish_success(
+                                        provider,
+                                        app_type_str,
+                                        permit,
+                                        mark_aimd_success,
+                                    )
+                                    .await;
 
                                     return Ok(ForwardResult {
                                         response,
@@ -1017,6 +922,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         connection_guard: None,
+                                        upstream_permit,
                                     });
                                 }
                                 Err(retry_err) => {
@@ -1107,7 +1013,14 @@ impl RequestForwarder {
                                 {
                                     Ok((response, claude_api_format, outbound_model)) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
-                                        self.finish_success(provider, app_type_str, permit).await;
+                                        let mark_aimd_success = !response.is_sse();
+                                        self.finish_success(
+                                            provider,
+                                            app_type_str,
+                                            permit,
+                                            mark_aimd_success,
+                                        )
+                                        .await;
 
                                         return Ok(ForwardResult {
                                             response,
@@ -1115,6 +1028,7 @@ impl RequestForwarder {
                                             claude_api_format,
                                             outbound_model,
                                             connection_guard: None,
+                                            upstream_permit,
                                         });
                                     }
                                     Err(retry_err) => {
@@ -1218,7 +1132,14 @@ impl RequestForwarder {
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
-                                    self.finish_success(provider, app_type_str, permit).await;
+                                    let mark_aimd_success = !response.is_sse();
+                                    self.finish_success(
+                                        provider,
+                                        app_type_str,
+                                        permit,
+                                        mark_aimd_success,
+                                    )
+                                    .await;
 
                                     return Ok(ForwardResult {
                                         response,
@@ -1226,6 +1147,7 @@ impl RequestForwarder {
                                         claude_api_format,
                                         outbound_model,
                                         connection_guard: None,
+                                        upstream_permit,
                                     });
                                 }
                                 Err(retry_err) => {
@@ -2583,11 +2505,11 @@ impl RequestForwarder {
             }
             let send = request.body(body_bytes).send();
             let send_result = if request_is_streaming {
-                let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
-                    timeout
-                } else {
-                    self.streaming_first_byte_timeout
-                };
+                let header_timeout = effective_response_header_timeout(
+                    true,
+                    self.streaming_first_byte_timeout,
+                    timeout,
+                );
                 tokio::time::timeout(header_timeout, send)
                     .await
                     .map_err(|_| {
@@ -2604,6 +2526,11 @@ impl RequestForwarder {
         } else {
             // HTTP 代理或直连：走 hyper raw write（保持 header 大小写）
             // 如果有 HTTP 代理，hyper_client 会用 CONNECT 隧道穿过代理
+            let hyper_timeout = effective_response_header_timeout(
+                request_is_streaming,
+                self.streaming_first_byte_timeout,
+                timeout,
+            );
             let uri: http::Uri = url.parse().map_err(|e| {
                 ProxyError::ForwardFailed(format!("Invalid upstream URL ({target_for_log}): {e}"))
             })?;
@@ -2614,7 +2541,7 @@ impl RequestForwarder {
                 ordered_headers,
                 extensions.clone(),
                 body_bytes,
-                timeout,
+                hyper_timeout,
                 upstream_proxy_url.as_deref(),
             )
             .await?
@@ -3057,10 +2984,15 @@ fn is_rate_limit_error(error: &ProxyError) -> bool {
     }
     .to_ascii_lowercase();
 
+    text_has_rate_limit_signal(&text)
+}
+
+fn text_has_rate_limit_signal(text: &str) -> bool {
     [
         "rate_limit",
         "rate limit",
         "too many requests",
+        "too many pending requests",
         "resource_exhausted",
         "resource exhausted",
         "quota exceeded",
@@ -3070,6 +3002,18 @@ fn is_rate_limit_error(error: &ProxyError) -> bool {
     ]
     .iter()
     .any(|signal| text.contains(signal))
+}
+
+fn effective_response_header_timeout(
+    request_is_streaming: bool,
+    streaming_first_byte_timeout: std::time::Duration,
+    fallback_timeout: std::time::Duration,
+) -> std::time::Duration {
+    if request_is_streaming && !streaming_first_byte_timeout.is_zero() {
+        streaming_first_byte_timeout
+    } else {
+        fallback_timeout
+    }
 }
 
 /// 从 ProxyError 中提取错误消息
@@ -4061,28 +4005,18 @@ mod tests {
             copilot_optimizer_config: CopilotOptimizerConfig::default(),
             non_streaming_timeout,
             streaming_first_byte_timeout,
-            streaming_idle_timeout: Duration::ZERO,
             max_attempts: 1,
         }
     }
 
     #[tokio::test]
     async fn claude_desktop_upstream_limiter_uses_aimd_window() {
-        let status = Arc::new(RwLock::new(ProxyStatus::default()));
         let limiter = AdaptiveConcurrencyLimiter::new(2, 4);
-        let first =
-            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone()))
-                .await;
-        let second =
-            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone()))
-                .await;
+        let first = limiter.acquire().await;
+        let second = limiter.acquire().await;
         assert_eq!(limiter.current_limit(), 2);
 
-        let blocked = tokio::time::timeout(
-            Duration::from_millis(25),
-            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone())),
-        )
-        .await;
+        let blocked = tokio::time::timeout(Duration::from_millis(25), limiter.acquire()).await;
         assert!(
             blocked.is_err(),
             "third request must wait for an active slot"
@@ -4091,23 +4025,17 @@ mod tests {
         limiter.mark_rate_limited(Duration::from_millis(40));
         assert_eq!(limiter.current_limit(), 1);
         drop(first);
-        let still_blocked = tokio::time::timeout(
-            Duration::from_millis(25),
-            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone())),
-        )
-        .await;
+        let still_blocked =
+            tokio::time::timeout(Duration::from_millis(25), limiter.acquire()).await;
         assert!(
             still_blocked.is_err(),
             "one remaining active request must fill the congested limit"
         );
 
         drop(second);
-        let third = tokio::time::timeout(
-            Duration::from_secs(1),
-            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone())),
-        )
-        .await
-        .expect("third request should resume when congested active count reaches zero");
+        let third = tokio::time::timeout(Duration::from_secs(1), limiter.acquire())
+            .await
+            .expect("third request should resume when congested active count reaches zero");
 
         for _ in 0..8 {
             limiter.mark_success();
@@ -4122,79 +4050,15 @@ mod tests {
             limiter.mark_success();
         }
         assert_eq!(limiter.current_limit(), 2);
-        let fourth = tokio::time::timeout(
-            Duration::from_secs(1),
-            ActiveConnectionGuard::acquire_with_limiter(status, Some(limiter.clone())),
-        )
-        .await
-        .expect("second slot should reopen additively after cooldown and successes");
+        let fourth = tokio::time::timeout(Duration::from_secs(1), limiter.acquire())
+            .await
+            .expect("second slot should reopen additively after cooldown and successes");
         for _ in 0..8 {
             limiter.mark_success();
         }
         assert_eq!(limiter.current_limit(), 3);
         drop(third);
         drop(fourth);
-    }
-
-    #[tokio::test]
-    async fn strict_desktop_stream_accepts_only_message_stop_terminated_stream() {
-        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
-        let complete = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("text/event-stream"),
-        );
-        let response = ProxyResponse::streamed(
-            StatusCode::OK,
-            headers,
-            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                complete.as_bytes(),
-            ))]),
-        );
-
-        let buffered = forwarder
-            .buffer_complete_anthropic_stream(response)
-            .await
-            .expect("complete stream");
-        assert_eq!(
-            buffered
-                .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
-                .await
-                .expect("buffered body"),
-            Bytes::from_static(complete.as_bytes())
-        );
-    }
-
-    #[tokio::test]
-    async fn strict_desktop_stream_rejects_truncated_stream_before_client_commit() {
-        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
-        let truncated = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("text/event-stream"),
-        );
-        let response = ProxyResponse::streamed(
-            StatusCode::OK,
-            headers,
-            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                truncated.as_bytes(),
-            ))]),
-        );
-
-        let error = match forwarder.buffer_complete_anthropic_stream(response).await {
-            Ok(_) => panic!("truncated stream must be retried internally"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("before message_stop"), "{error}");
     }
 
     #[test]
@@ -4227,10 +4091,31 @@ mod tests {
         assert!(is_rate_limit_error(&ProxyError::TransformError(
             "RESOURCE_EXHAUSTED".to_string()
         )));
+        assert!(is_rate_limit_error(&ProxyError::ForwardFailed(
+            "Too many pending requests, please retry later".to_string()
+        )));
         assert!(!is_rate_limit_error(&ProxyError::UpstreamError {
             status: 403,
             body: Some("permission denied".to_string()),
         }));
+    }
+
+    #[test]
+    fn streaming_hyper_path_uses_first_byte_timeout_not_non_streaming_timeout() {
+        let first_byte = Duration::from_secs(60);
+        let non_streaming = Duration::from_secs(600);
+        assert_eq!(
+            effective_response_header_timeout(true, first_byte, non_streaming),
+            first_byte
+        );
+        assert_eq!(
+            effective_response_header_timeout(false, first_byte, non_streaming),
+            non_streaming
+        );
+        assert_eq!(
+            effective_response_header_timeout(true, Duration::ZERO, non_streaming),
+            non_streaming
+        );
     }
 
     #[test]
