@@ -35,9 +35,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tauri::Manager;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
@@ -131,16 +131,53 @@ pub struct ForwardError {
 /// 不需要每条出口路径都手动调用。
 pub(crate) struct ActiveConnectionGuard {
     status: Arc<RwLock<ProxyStatus>>,
+    _upstream_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ActiveConnectionGuard {
-    pub(crate) async fn acquire(status: Arc<RwLock<ProxyStatus>>) -> Self {
+    pub(crate) async fn acquire(
+        status: Arc<RwLock<ProxyStatus>>,
+        serialize_claude_desktop: bool,
+    ) -> Self {
+        let limiter = serialize_claude_desktop.then(claude_desktop_upstream_limiter);
+        Self::acquire_with_limiter(status, limiter).await
+    }
+
+    async fn acquire_with_limiter(
+        status: Arc<RwLock<ProxyStatus>>,
+        limiter: Option<Arc<Semaphore>>,
+    ) -> Self {
+        let queued_at = std::time::Instant::now();
+        let upstream_permit = match limiter {
+            Some(limiter) => Some(
+                limiter
+                    .acquire_owned()
+                    .await
+                    .expect("Claude Desktop upstream semaphore is never closed"),
+            ),
+            None => None,
+        };
+        if upstream_permit.is_some() && queued_at.elapsed() >= std::time::Duration::from_millis(10)
+        {
+            log::info!(
+                "[claude-desktop] 上游并发队列等待 {}ms（并发上限=1）",
+                queued_at.elapsed().as_millis()
+            );
+        }
         {
             let mut s = status.write().await;
             s.active_connections = s.active_connections.saturating_add(1);
         }
-        Self { status }
+        Self {
+            status,
+            _upstream_permit: upstream_permit,
+        }
     }
+}
+
+fn claude_desktop_upstream_limiter() -> Arc<Semaphore> {
+    static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMITER.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
 }
 
 impl Drop for ActiveConnectionGuard {
@@ -503,7 +540,11 @@ impl RequestForwarder {
         extensions: Extensions,
         providers: Vec<Provider>,
     ) -> Result<ForwardResult, ForwardError> {
-        let guard = ActiveConnectionGuard::acquire(self.status.clone()).await;
+        let guard = ActiveConnectionGuard::acquire(
+            self.status.clone(),
+            matches!(app_type, AppType::ClaudeDesktop),
+        )
+        .await;
         {
             let mut s = self.status.write().await;
             s.total_requests = s.total_requests.saturating_add(1);
@@ -3844,6 +3885,34 @@ mod tests {
             streaming_idle_timeout: Duration::ZERO,
             max_attempts: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_upstream_limiter_serializes_full_request_lifecycle() {
+        let status = Arc::new(RwLock::new(ProxyStatus::default()));
+        let limiter = Arc::new(Semaphore::new(1));
+        let first =
+            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone()))
+                .await;
+        assert_eq!(limiter.available_permits(), 0);
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone())),
+        )
+        .await;
+        assert!(blocked.is_err(), "second request must wait for the first");
+
+        drop(first);
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            ActiveConnectionGuard::acquire_with_limiter(status, Some(limiter.clone())),
+        )
+        .await
+        .expect("second request should resume after first response lifecycle ends");
+        assert_eq!(limiter.available_permits(), 0);
+        drop(second);
+        assert_eq!(limiter.available_permits(), 1);
     }
 
     #[tokio::test]
