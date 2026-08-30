@@ -742,7 +742,6 @@ struct AnthropicTerminalState {
     error_message: Option<String>,
     open_content_blocks: HashMap<u64, String>,
     tool_input_json: HashMap<u64, String>,
-    max_content_block_index: Option<u64>,
     saw_text_block: bool,
     saw_text_delta: bool,
     saw_tool_use_block: bool,
@@ -798,49 +797,16 @@ fn describe_anthropic_sse_block(block: &str) -> AnthropicEventDescriptor {
     }
 }
 
-fn incomplete_block_fallback_events(index: u64, _block_type: &str) -> Vec<String> {
-    vec![
-        format!(
-            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}"
-        ),
-        format!(
-            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}"
-        ),
-    ]
-}
-
-fn abandon_incomplete_anthropic_blocks(
-    held: &mut HashMap<u64, HeldAnthropicContentBlock>,
-) -> Vec<String> {
-    let mut indices = held.keys().copied().collect::<Vec<_>>();
-    indices.sort_unstable();
-    let mut fallback = Vec::new();
-    for index in indices {
-        if let Some(block) = held.remove(&index) {
-            fallback.extend(incomplete_block_fallback_events(index, &block.block_type));
-        }
-    }
-    fallback
-}
-
-fn materialize_incomplete_anthropic_blocks(
+fn discard_incomplete_anthropic_blocks(
     held: &mut HashMap<u64, HeldAnthropicContentBlock>,
     state: &mut AnthropicTerminalState,
-) -> Vec<Bytes> {
-    let events = abandon_incomplete_anthropic_blocks(held);
-    if !events.is_empty() {
+) -> bool {
+    let had_incomplete_blocks = !held.is_empty();
+    held.clear();
+    if had_incomplete_blocks {
         state.silent_recovery_requested = true;
     }
-    events
-        .into_iter()
-        .map(|event| {
-            observe_anthropic_sse_block(&event, state);
-            Bytes::from(format!(
-                "{}\n\n",
-                event.trim_end_matches(|c| c == '\r' || c == '\n')
-            ))
-        })
-        .collect()
+    had_incomplete_blocks
 }
 
 fn ensure_anthropic_silent_recovery(state: &mut AnthropicTerminalState) -> Vec<Bytes> {
@@ -851,19 +817,6 @@ fn ensure_anthropic_silent_recovery(state: &mut AnthropicTerminalState) -> Vec<B
         );
     }
     state.silent_recovery_requested = true;
-    if !state.saw_text_delta
-        && !state
-            .open_content_blocks
-            .values()
-            .any(|block_type| block_type == "text")
-    {
-        let index = state
-            .max_content_block_index
-            .map(|current| current.saturating_add(1))
-            .unwrap_or(0);
-        events.extend(incomplete_block_fallback_events(index, "stream"));
-    }
-
     events
         .into_iter()
         .map(|event| {
@@ -898,12 +851,6 @@ fn observe_anthropic_sse_block(block: &str, state: &mut AnthropicTerminalState) 
                 .and_then(|value| value.get("index"))
                 .and_then(Value::as_u64)
             {
-                state.max_content_block_index = Some(
-                    state
-                        .max_content_block_index
-                        .map(|current| current.max(index))
-                        .unwrap_or(index),
-                );
                 let block_type = parsed
                     .as_ref()
                     .and_then(|value| value.pointer("/content_block/type"))
@@ -1166,10 +1113,11 @@ pub fn create_logged_passthrough_stream(
                                 // 事件之前 Claude 就可能先解析到半截 JSON/UTF-8 并报错。
                                 buffer.clear();
                                 utf8_remainder.clear();
-                                let mut fallback_blocks = materialize_incomplete_anthropic_blocks(
+                                let _ = discard_incomplete_anthropic_blocks(
                                     &mut held_anthropic_blocks,
                                     &mut anthropic_state,
                                 );
+                                let mut fallback_blocks = Vec::new();
                                 if terminal_policy.is_claude_desktop() {
                                     fallback_blocks.extend(ensure_anthropic_silent_recovery(
                                         &mut anthropic_state,
@@ -1257,20 +1205,6 @@ pub fn create_logged_passthrough_stream(
                                                 ignored_held_indices.insert(index);
                                                 rewrote_incomplete_content = true;
                                                 anthropic_state.silent_recovery_requested = true;
-                                                for fallback in
-                                                    incomplete_block_fallback_events(
-                                                        index,
-                                                        &block_type,
-                                                    )
-                                                {
-                                                    observe_anthropic_sse_block(
-                                                        &fallback,
-                                                        &mut anthropic_state,
-                                                    );
-                                                    completed_anthropic_blocks.push(Bytes::from(
-                                                        format!("{fallback}\n\n"),
-                                                    ));
-                                                }
                                             }
                                         }
                                     } else if let Some(index) = descriptor.index {
@@ -1301,20 +1235,6 @@ pub fn create_logged_passthrough_stream(
                                                 }
                                                 rewrote_incomplete_content = true;
                                                 anthropic_state.silent_recovery_requested = true;
-                                                for fallback in
-                                                    incomplete_block_fallback_events(
-                                                        index,
-                                                        &held.block_type,
-                                                    )
-                                                {
-                                                    observe_anthropic_sse_block(
-                                                        &fallback,
-                                                        &mut anthropic_state,
-                                                    );
-                                                    completed_anthropic_blocks.push(Bytes::from(
-                                                        format!("{fallback}\n\n"),
-                                                    ));
-                                                }
                                             } else if descriptor.event_type
                                                 == "content_block_stop"
                                             {
@@ -1336,10 +1256,7 @@ pub fn create_logged_passthrough_stream(
                                                 let events = if invalid_tool {
                                                     rewrote_incomplete_content = true;
                                                     anthropic_state.silent_recovery_requested = true;
-                                                    incomplete_block_fallback_events(
-                                                        index,
-                                                        &held.block_type,
-                                                    )
+                                                    Vec::new()
                                                 } else {
                                                     held.events
                                                 };
@@ -1367,16 +1284,13 @@ pub fn create_logged_passthrough_stream(
                                             "message_delta" | "message_stop" | "error"
                                         ) && !held_anthropic_blocks.is_empty()
                                         {
-                                            let fallback_blocks =
-                                                materialize_incomplete_anthropic_blocks(
+                                            rewrote_incomplete_content |=
+                                                discard_incomplete_anthropic_blocks(
                                                     &mut held_anthropic_blocks,
                                                     &mut anthropic_state,
                                                 );
-                                            rewrote_incomplete_content |=
-                                                !fallback_blocks.is_empty();
                                             held_anthropic_bytes = 0;
                                             ignored_held_indices.clear();
-                                            completed_anthropic_blocks.extend(fallback_blocks);
                                         }
                                         let suppress_midstream_error = descriptor.event_type
                                             == "error"
@@ -1493,10 +1407,11 @@ pub fn create_logged_passthrough_stream(
                             );
                             buffer.clear();
                             utf8_remainder.clear();
-                            let mut recovery_blocks = materialize_incomplete_anthropic_blocks(
+                            let _ = discard_incomplete_anthropic_blocks(
                                 &mut held_anthropic_blocks,
                                 &mut anthropic_state,
                             );
+                            let mut recovery_blocks = Vec::new();
                             if terminal_policy.is_claude_desktop() {
                                 recovery_blocks.extend(ensure_anthropic_silent_recovery(
                                     &mut anthropic_state,
@@ -1568,12 +1483,16 @@ pub fn create_logged_passthrough_stream(
                             if let Some(guard) = connection_guard.as_mut() {
                                 guard.mark_stream_success().await;
                             }
-                        } else if let Some(guard) = connection_guard.as_mut() {
-                            guard
-                                .mark_stream_failure(
-                                    "Upstream emitted message_stop before a complete Anthropic turn",
-                                )
-                                .await;
+                        } else {
+                            const MESSAGE_STOP_REPAIR_FAILURE: &str =
+                                "Upstream emitted message_stop before a complete Anthropic turn";
+                            if let Some(guard) = connection_guard.as_mut() {
+                                guard.mark_stream_failure(MESSAGE_STOP_REPAIR_FAILURE).await;
+                            }
+                            if let Some(c) = &collector {
+                                c.set_terminal_failure(502, MESSAGE_STOP_REPAIR_FAILURE)
+                                    .await;
+                            }
                         }
                     }
 
@@ -1615,10 +1534,11 @@ pub fn create_logged_passthrough_stream(
                     if terminal_policy.is_anthropic() {
                         buffer.clear();
                         utf8_remainder.clear();
-                        let mut fallback_blocks = materialize_incomplete_anthropic_blocks(
+                        let _ = discard_incomplete_anthropic_blocks(
                             &mut held_anthropic_blocks,
                             &mut anthropic_state,
                         );
+                        let mut fallback_blocks = Vec::new();
                         if terminal_policy.is_claude_desktop() {
                             fallback_blocks.extend(ensure_anthropic_silent_recovery(
                                 &mut anthropic_state,
@@ -1652,10 +1572,11 @@ pub fn create_logged_passthrough_stream(
                     if terminal_policy.is_anthropic() {
                         buffer.clear();
                         utf8_remainder.clear();
-                        let mut fallback_blocks = materialize_incomplete_anthropic_blocks(
+                        rewrote_incomplete_content |= discard_incomplete_anthropic_blocks(
                             &mut held_anthropic_blocks,
                             &mut anthropic_state,
                         );
+                        let mut fallback_blocks = Vec::new();
                         if terminal_policy.is_claude_desktop()
                             && !anthropic_can_complete_safely(&anthropic_state)
                         {
@@ -1663,7 +1584,6 @@ pub fn create_logged_passthrough_stream(
                                 &mut anthropic_state,
                             ));
                         }
-                        rewrote_incomplete_content |= !fallback_blocks.is_empty();
                         let terminals = anthropic_terminal_chunks(
                             &anthropic_state,
                             "stream_truncated",
@@ -1686,7 +1606,9 @@ pub fn create_logged_passthrough_stream(
                                     .await;
                             }
                         }
-                        if !anthropic_can_complete_safely(&anthropic_state) {
+                        if rewrote_incomplete_content
+                            || !anthropic_can_complete_safely(&anthropic_state)
+                        {
                             if let Some(c) = &collector {
                                 c.set_terminal_failure(
                                     502,
@@ -1782,6 +1704,22 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    fn terminal_outcome_collector() -> (
+        SseUsageCollector,
+        Arc<std::sync::Mutex<Option<StreamTerminalOutcome>>>,
+    ) {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let collector = SseUsageCollector::new(
+            std::time::Instant::now(),
+            None,
+            move |_, _, terminal_outcome| {
+                *sink.lock().expect("terminal outcome lock") = Some(terminal_outcome);
+            },
+        );
+        (collector, captured)
+    }
 
     #[test]
     fn format_headers_keeps_only_allowlisted_diagnostic_values() {
@@ -2163,6 +2101,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_desktop_dropped_tool_use_rewrites_upstream_tool_stop_reason() {
+        let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"kept\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"Bash\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ))]);
+        let (collector, captured_outcome) = terminal_outcome_collector();
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            Some(collector),
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::ClaudeDesktopAnthropic,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("kept"), "{text}");
+        assert!(!text.contains("\"type\":\"tool_use\""), "{text}");
+        assert!(!text.contains("\"stop_reason\":\"tool_use\""), "{text}");
+        assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
+        assert_eq!(text.matches("event: message_stop").count(), 1, "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+        let outcome = captured_outcome
+            .lock()
+            .expect("captured outcome lock")
+            .clone()
+            .expect("terminal outcome");
+        assert_eq!(outcome.status_code_override, Some(502));
+        assert!(outcome
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("message_stop")));
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_eof_after_dropped_tool_marks_log_failure() {
+        let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"kept\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"Bash\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\"}}\n\n",
+        ))]);
+        let (collector, captured_outcome) = terminal_outcome_collector();
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            Some(collector),
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::ClaudeDesktopAnthropic,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("kept"), "{text}");
+        assert!(!text.contains("\"type\":\"tool_use\""), "{text}");
+        assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+        let outcome = captured_outcome
+            .lock()
+            .expect("captured outcome lock")
+            .clone()
+            .expect("terminal outcome");
+        assert_eq!(outcome.status_code_override, Some(502));
+        assert!(outcome
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("before message_stop")));
+    }
+
+    #[tokio::test]
     async fn claude_desktop_midstream_error_preserves_text_as_completed_turn() {
         let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
             b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial answer\"}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Please retry later\"}}\n\n",
@@ -2260,6 +2286,8 @@ mod tests {
         assert!(text.contains("event: message_stop"), "{text}");
         assert!(!text.contains("event: error"), "{text}");
         assert!(!text.contains("text_delta"), "{text}");
+        assert!(!text.contains("content_block_start"), "{text}");
+        assert!(!text.contains("content_block_stop"), "{text}");
         assert!(!text.contains("CC Switch"), "{text}");
         assert!(!text.contains("自动续试"), "{text}");
         assert!(!text.contains("安全取消"), "{text}");
@@ -2293,6 +2321,8 @@ mod tests {
         assert!(text.contains("event: message_stop"), "{text}");
         assert!(!text.contains("event: error"), "{text}");
         assert!(!text.contains("text_delta"), "{text}");
+        assert!(!text.contains("content_block_start"), "{text}");
+        assert!(!text.contains("content_block_stop"), "{text}");
         assert!(!text.contains("CC Switch"), "{text}");
     }
 

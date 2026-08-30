@@ -692,6 +692,74 @@ pub fn model_list_response(provider: &Provider) -> Result<Value, AppError> {
     }))
 }
 
+#[derive(Default)]
+struct ClaudeDesktopHistorySanitization {
+    removed_text_blocks: usize,
+    removed_messages: usize,
+    removed_system: bool,
+}
+
+fn remove_invalid_anthropic_text_blocks(content: &mut Vec<Value>) -> usize {
+    let before = content.len();
+    content.retain(|block| {
+        block.get("type").and_then(Value::as_str) != Some("text")
+            || block
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+    });
+    before.saturating_sub(content.len())
+}
+
+fn sanitize_claude_desktop_history(body: &mut Value) {
+    let mut stats = ClaudeDesktopHistorySanitization::default();
+
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        messages.retain_mut(|message| {
+            match message.get_mut("content") {
+                Some(Value::Array(content)) => {
+                    stats.removed_text_blocks += remove_invalid_anthropic_text_blocks(content);
+                    if content.is_empty() {
+                        stats.removed_messages += 1;
+                        return false;
+                    }
+                }
+                Some(Value::String(content)) if content.trim().is_empty() => {
+                    stats.removed_messages += 1;
+                    return false;
+                }
+                _ => {}
+            }
+            true
+        });
+    }
+
+    let mut remove_system = false;
+    match body.get_mut("system") {
+        Some(Value::Array(system)) => {
+            stats.removed_text_blocks += remove_invalid_anthropic_text_blocks(system);
+            remove_system = system.is_empty();
+        }
+        Some(Value::String(system)) => remove_system = system.trim().is_empty(),
+        _ => {}
+    }
+    if remove_system {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("system");
+        }
+        stats.removed_system = true;
+    }
+
+    if stats.removed_text_blocks > 0 || stats.removed_messages > 0 || stats.removed_system {
+        log::warn!(
+            "[claude-desktop] 已清理不可发送的空历史: invalid_text_blocks={}, empty_messages={}, empty_system={}",
+            stats.removed_text_blocks,
+            stats.removed_messages,
+            stats.removed_system
+        );
+    }
+}
+
 pub fn map_proxy_request_model(mut body: Value, provider: &Provider) -> Result<Value, AppError> {
     let requested_raw = body
         .get("model")
@@ -755,6 +823,10 @@ pub fn map_proxy_request_model(mut body: Value, provider: &Provider) -> Result<V
             )
         })?;
 
+    // 旧版静默流恢复可能被 Claude Desktop 持久化成 {"type":"text"}、
+    // 空白 text 或 content:[]，严格上游会因此返回 400。只删除不可发送的空内容，
+    // 不填充空格或提示文字；其他工具、图片和真实文本保持原样。
+    sanitize_claude_desktop_history(&mut body);
     body["model"] = json!(upstream_model);
     if body
         .get("max_tokens")
@@ -1889,6 +1961,87 @@ mod tests {
         .expect("map internal poll request");
 
         assert_eq!(mapped["max_tokens"], json!(3));
+    }
+
+    #[test]
+    fn claude_desktop_proxy_removes_missing_text_history_without_placeholder() {
+        let provider = proxy_provider("proxy");
+        let mapped = map_proxy_request_model(
+            json!({
+                "model": "claude-sonnet-4-6",
+                "system": [{"type": "text"}],
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "before"}]},
+                    {"role": "assistant", "content": [{"type": "text"}]},
+                    {"role": "assistant", "content": []},
+                    {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text"},
+                            {"type": "tool_use", "id": "tool_1", "name": "read", "input": {}}
+                        ]
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "   \r\n"}]}
+                ]
+            }),
+            &provider,
+        )
+        .expect("sanitize malformed Desktop history");
+
+        let messages = mapped["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"][0]["text"], json!("before"));
+        assert_eq!(messages[1]["content"][0]["text"], json!("continue"));
+        assert_eq!(messages[2]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[2]["content"][0]["type"], json!("tool_use"));
+        assert!(mapped.get("system").is_none());
+    }
+
+    #[test]
+    fn claude_desktop_proxy_sanitizer_preserves_valid_and_unrelated_content() {
+        let provider = proxy_provider("proxy");
+        let mapped = map_proxy_request_model(
+            json!({
+                "model": "claude-sonnet-4-6",
+                "system": [
+                    {"type": "text"},
+                    {"type": "text", "text": null},
+                    {"type": "text", "text": 7},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": " \n\t"},
+                    {"type": "text", "text": "system"},
+                    {"type": "image", "text": 7, "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}
+                ],
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "  \n"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": ""},
+                            {"type": "image", "text": 7, "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}
+                        ]
+                    }
+                ]
+            }),
+            &provider,
+        )
+        .expect("preserve valid Desktop history");
+
+        assert_eq!(mapped["messages"][0]["content"], json!("hello"));
+        assert_eq!(
+            mapped["messages"][1]["content"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(mapped["messages"][1]["content"][0]["type"], json!("image"));
+        let system = mapped["system"].as_array().expect("system");
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["type"], json!("text"));
+        assert_eq!(system[0]["text"], json!("system"));
+        assert_eq!(system[1]["type"], json!("image"));
+        assert_eq!(system[1]["text"], json!(7));
     }
 
     #[test]
