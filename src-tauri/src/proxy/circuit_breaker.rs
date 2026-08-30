@@ -238,6 +238,13 @@ impl CircuitBreaker {
             return RecordDisposition::Stale;
         }
         if permit.used_half_open_permit {
+            // record_success/record_failure 会先推进 failure_generation，再释放
+            // HalfOpen 名额。若异步调用随后被取消，外层 RAII guard 仍可能走到
+            // neutral Drop；代际已变化表示该 permit 已被消费，不能再次减掉后来
+            // 新 probe 的名额。
+            if self.failure_generation.load(Ordering::SeqCst) != permit.failure_generation {
+                return RecordDisposition::Stale;
+            }
             self.release_half_open_permit();
         }
         RecordDisposition::Counted
@@ -251,10 +258,6 @@ impl CircuitBreaker {
         let state = *self.state.read().await;
         let config = self.config.read().await;
 
-        if permit.used_half_open_permit {
-            self.release_half_open_permit();
-        }
-
         if self
             .failure_generation
             .compare_exchange(
@@ -265,7 +268,14 @@ impl CircuitBreaker {
             )
             .is_err()
         {
+            if permit.used_half_open_permit {
+                self.release_half_open_permit();
+            }
             return RecordDisposition::DuplicateBatch;
+        }
+
+        if permit.used_half_open_permit {
+            self.release_half_open_permit();
         }
 
         // 重置失败计数
@@ -295,13 +305,12 @@ impl CircuitBreaker {
         let state = *self.state.read().await;
         let config = self.config.read().await;
 
-        if permit.used_half_open_permit {
-            self.release_half_open_permit();
-        }
-
         // Open 之后才返回的同批在途请求只完成日志链路，不再污染熔断统计。
         // 它们在 Open 之前已经发往上游，无法撤回，但也不应继续累加失败数。
         if state == CircuitState::Open {
+            if permit.used_half_open_permit {
+                self.release_half_open_permit();
+            }
             return RecordDisposition::Stale;
         }
 
@@ -315,7 +324,14 @@ impl CircuitBreaker {
             )
             .is_err()
         {
+            if permit.used_half_open_permit {
+                self.release_half_open_permit();
+            }
             return RecordDisposition::DuplicateBatch;
+        }
+
+        if permit.used_half_open_permit {
+            self.release_half_open_permit();
         }
 
         // 更新计数器
@@ -602,6 +618,34 @@ mod tests {
         let second = breaker.allow_request().await;
         assert!(!second.allowed);
         assert!(!second.used_half_open_permit);
+    }
+
+    #[tokio::test]
+    async fn consumed_half_open_permit_cannot_release_a_new_probe() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            success_threshold: 2,
+            ..Default::default()
+        });
+        breaker.transition_to_open().await;
+        breaker.transition_to_half_open().await;
+
+        let consumed = breaker.allow_request().await;
+        assert!(consumed.allowed && consumed.used_half_open_permit);
+        assert_eq!(
+            breaker.record_success(consumed).await,
+            RecordDisposition::Counted
+        );
+
+        let current = breaker.allow_request().await;
+        assert!(current.allowed && current.used_half_open_permit);
+        assert_eq!(
+            breaker.release_neutral(consumed),
+            RecordDisposition::Stale,
+            "a cancelled outer guard must not release the next generation's probe"
+        );
+        let blocked = breaker.allow_request().await;
+        assert!(!blocked.allowed);
+        breaker.release_neutral(current);
     }
 
     #[tokio::test]

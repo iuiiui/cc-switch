@@ -34,7 +34,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use tauri::Manager;
 use tokio::sync::{Notify, RwLock};
 
@@ -112,11 +115,198 @@ pub struct ForwardResult {
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
     upstream_permit: Option<AdaptiveConcurrencyPermit>,
+    stream_outcome: Option<StreamProviderOutcome>,
 }
 
 pub struct ForwardError {
     pub error: ProxyError,
     pub provider: Option<Provider>,
+}
+
+struct StreamProviderOutcome {
+    router: Arc<ProviderRouter>,
+    status: Arc<RwLock<ProxyStatus>>,
+    current_providers: Arc<RwLock<HashMap<String, (String, String)>>>,
+    failover_manager: Arc<FailoverSwitchManager>,
+    app_handle: Option<tauri::AppHandle>,
+    current_provider_id_at_start: String,
+    provider: Provider,
+    app_type: String,
+    circuit_permit: Option<AllowResult>,
+}
+
+impl StreamProviderOutcome {
+    async fn finish_success(&mut self) {
+        let Some(permit) = self.circuit_permit else {
+            return;
+        };
+        let record_result = self
+            .router
+            .record_result(&self.provider.id, &self.app_type, permit, true, None)
+            .await;
+        self.circuit_permit = None;
+        if let Err(error) = record_result {
+            log::warn!(
+                "[{}] 记录流式 Provider 成功失败: provider_id={}, error={error}",
+                self.app_type,
+                self.provider.id
+            );
+        }
+        {
+            let mut status = self.status.write().await;
+            status.success_requests = status.success_requests.saturating_add(1);
+            status.last_error = None;
+            if status.total_requests > 0 {
+                status.success_rate =
+                    (status.success_requests as f32 / status.total_requests as f32) * 100.0;
+            }
+        }
+
+        if self.current_provider_id_at_start == self.provider.id {
+            self.current_providers.write().await.insert(
+                self.app_type.clone(),
+                (self.provider.id.clone(), self.provider.name.clone()),
+            );
+            return;
+        }
+
+        let expected = (!self.current_provider_id_at_start.is_empty())
+            .then(|| self.current_provider_id_at_start.clone());
+        match self
+            .failover_manager
+            .try_switch_if_current(
+                self.app_handle.as_ref(),
+                &self.app_type,
+                expected.as_deref(),
+                &self.provider.id,
+                &self.provider.name,
+            )
+            .await
+        {
+            Ok(true) => {
+                self.current_providers.write().await.insert(
+                    self.app_type.clone(),
+                    (self.provider.id.clone(), self.provider.name.clone()),
+                );
+                let mut status = self.status.write().await;
+                status.failover_count = status.failover_count.saturating_add(1);
+            }
+            Ok(false) => {}
+            Err(error) => log::warn!("[Failover] 提交流式供应商切换失败: {error}"),
+        }
+    }
+
+    async fn finish_failure(&mut self, message: String, rate_limited: bool) {
+        let Some(permit) = self.circuit_permit else {
+            return;
+        };
+        if rate_limited {
+            if let Err(error) = self
+                .router
+                .mark_provider_rate_limited(&self.provider.id, &self.app_type)
+                .await
+            {
+                log::warn!(
+                    "[{}] 记录流内速率限制失败: provider_id={}, error={error}",
+                    self.app_type,
+                    self.provider.id
+                );
+            }
+        }
+        let record_result = self
+            .router
+            .record_result(
+                &self.provider.id,
+                &self.app_type,
+                permit,
+                false,
+                Some(message.clone()),
+            )
+            .await;
+        self.circuit_permit = None;
+        if let Err(error) = record_result {
+            log::warn!(
+                "[{}] 记录流式 Provider 失败失败: provider_id={}, error={error}",
+                self.app_type,
+                self.provider.id
+            );
+        }
+        let mut status = self.status.write().await;
+        status.failed_requests = status.failed_requests.saturating_add(1);
+        status.last_error = Some(format!("Provider {} 流失败: {message}", self.provider.name));
+        if status.total_requests > 0 {
+            status.success_rate =
+                (status.success_requests as f32 / status.total_requests as f32) * 100.0;
+        }
+    }
+}
+
+impl Drop for StreamProviderOutcome {
+    fn drop(&mut self) {
+        let Some(permit) = self.circuit_permit.take() else {
+            return;
+        };
+        let router = self.router.clone();
+        let provider_id = self.provider.id.clone();
+        let app_type = self.app_type.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                router
+                    .release_permit_neutral(&provider_id, &app_type, permit)
+                    .await;
+            });
+        }
+    }
+}
+
+struct CircuitPermitGuard {
+    router: Arc<ProviderRouter>,
+    provider_id: String,
+    app_type: String,
+    permit: Option<AllowResult>,
+}
+
+impl CircuitPermitGuard {
+    fn new(
+        router: Arc<ProviderRouter>,
+        provider_id: String,
+        app_type: String,
+        permit: AllowResult,
+    ) -> Self {
+        Self {
+            router,
+            provider_id,
+            app_type,
+            permit: Some(permit),
+        }
+    }
+
+    fn permit(&self) -> AllowResult {
+        self.permit
+            .expect("circuit permit must be finalized exactly once")
+    }
+
+    fn disarm(&mut self) {
+        self.permit = None;
+    }
+}
+
+impl Drop for CircuitPermitGuard {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        let router = self.router.clone();
+        let provider_id = self.provider_id.clone();
+        let app_type = self.app_type.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                router
+                    .release_permit_neutral(&provider_id, &app_type, permit)
+                    .await;
+            });
+        }
+    }
 }
 
 /// 活跃连接 RAII guard
@@ -132,6 +322,7 @@ pub struct ForwardError {
 pub(crate) struct ActiveConnectionGuard {
     status: Arc<RwLock<ProxyStatus>>,
     _upstream_permit: Option<AdaptiveConcurrencyPermit>,
+    stream_outcome: Option<StreamProviderOutcome>,
 }
 
 #[derive(Debug)]
@@ -140,6 +331,7 @@ struct AdaptiveConcurrencyState {
     limit: usize,
     congestion_until: Option<std::time::Instant>,
     successes_since_increase: u32,
+    last_pressure_increase: Option<std::time::Instant>,
 }
 
 struct AdaptiveConcurrencyLimiter {
@@ -163,6 +355,7 @@ impl AdaptiveConcurrencyLimiter {
                 limit: initial_limit,
                 congestion_until: None,
                 successes_since_increase: 0,
+                last_pressure_increase: None,
             }),
             notify: Notify::new(),
         })
@@ -179,6 +372,7 @@ impl AdaptiveConcurrencyLimiter {
         state.limit
     }
 
+    #[cfg(test)]
     async fn acquire(self: &Arc<Self>) -> AdaptiveConcurrencyPermit {
         loop {
             let notified = self.notify.notified();
@@ -198,10 +392,9 @@ impl AdaptiveConcurrencyLimiter {
                     )
                 }
             };
-            if let Some(limit) = acquired_limit {
+            if acquired_limit.is_some() {
                 return AdaptiveConcurrencyPermit {
                     limiter: self.clone(),
-                    acquired_limit: limit,
                 };
             }
             match wake_after {
@@ -216,12 +409,66 @@ impl AdaptiveConcurrencyLimiter {
         }
     }
 
+    fn try_acquire(self: &Arc<Self>) -> Option<AdaptiveConcurrencyPermit> {
+        let now = std::time::Instant::now();
+        let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+        let limit = self.current_limit_locked(&mut state, now);
+        if state.active >= limit {
+            return None;
+        }
+        state.active += 1;
+        Some(AdaptiveConcurrencyPermit {
+            limiter: self.clone(),
+        })
+    }
+
+    /// 有排队压力且最近没有 429 时，每秒最多把窗口增加一个槽位。
+    ///
+    /// 这让长流不会把后续请求无限饿死，同时保持硬上限；429 cooldown 期间
+    /// 完全禁止压力扩窗，避免为了消除排队又制造并发风暴。
+    fn try_acquire_under_pressure(
+        self: &Arc<Self>,
+        min_increase_interval: std::time::Duration,
+    ) -> Option<AdaptiveConcurrencyPermit> {
+        let now = std::time::Instant::now();
+        let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+        let current_limit = self.current_limit_locked(&mut state, now);
+        if state.active < current_limit {
+            state.active += 1;
+            return Some(AdaptiveConcurrencyPermit {
+                limiter: self.clone(),
+            });
+        }
+        if state.congestion_until.is_some()
+            || current_limit >= self.max_limit
+            || state.active >= self.max_limit
+            || state
+                .last_pressure_increase
+                .is_some_and(|last| now.duration_since(last) < min_increase_interval)
+        {
+            return None;
+        }
+
+        state.limit = (current_limit + 1).min(self.max_limit);
+        state.active += 1;
+        state.last_pressure_increase = Some(now);
+        log::info!(
+            "[claude-desktop] 检测到持续排队，动态并发窗口 {} → {}",
+            current_limit,
+            state.limit
+        );
+        Some(AdaptiveConcurrencyPermit {
+            limiter: self.clone(),
+        })
+    }
+
     fn release(&self) {
         {
             let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
             state.active = state.active.saturating_sub(1);
         }
         self.notify.notify_waiters();
+        claude_desktop_capacity_notify().notify_waiters();
     }
 
     fn mark_rate_limited(&self, cooldown: std::time::Duration) {
@@ -294,7 +541,16 @@ impl AdaptiveConcurrencyLimiter {
 
 struct AdaptiveConcurrencyPermit {
     limiter: Arc<AdaptiveConcurrencyLimiter>,
-    acquired_limit: usize,
+}
+
+impl AdaptiveConcurrencyPermit {
+    fn mark_success(&self) {
+        self.limiter.mark_success();
+    }
+
+    fn mark_rate_limited(&self, cooldown: std::time::Duration) {
+        self.limiter.mark_rate_limited(cooldown);
+    }
 }
 
 impl Drop for AdaptiveConcurrencyPermit {
@@ -312,29 +568,67 @@ impl ActiveConnectionGuard {
         Self {
             status,
             _upstream_permit: None,
+            stream_outcome: None,
         }
     }
 
-    fn attach_upstream_permit(&mut self, permit: Option<AdaptiveConcurrencyPermit>) {
+    fn attach_upstream_permit(
+        &mut self,
+        permit: Option<AdaptiveConcurrencyPermit>,
+        stream_outcome: Option<StreamProviderOutcome>,
+    ) {
         self._upstream_permit = permit;
+        self.stream_outcome = stream_outcome;
+    }
+
+    pub(crate) async fn mark_stream_success(&mut self) {
+        if let Some(outcome) = self.stream_outcome.as_mut() {
+            outcome.finish_success().await;
+        }
+        if let Some(permit) = self._upstream_permit.as_ref() {
+            permit.mark_success();
+        }
+    }
+
+    pub(crate) async fn note_stream_error(&mut self, error_type: &str, message: &str) {
+        let combined = format!("{error_type}: {message}");
+        let rate_limited = text_has_rate_limit_signal(&combined.to_ascii_lowercase());
+        if rate_limited {
+            if let Some(permit) = self._upstream_permit.as_ref() {
+                permit.mark_rate_limited(std::time::Duration::from_secs(30));
+            }
+        }
+        if let Some(outcome) = self.stream_outcome.as_mut() {
+            outcome.finish_failure(combined, rate_limited).await;
+        }
+    }
+
+    pub(crate) async fn mark_stream_failure(&mut self, message: &str) {
+        if let Some(outcome) = self.stream_outcome.as_mut() {
+            outcome.finish_failure(message.to_string(), false).await;
+        }
     }
 }
 
-fn claude_desktop_upstream_limiter() -> Arc<AdaptiveConcurrencyLimiter> {
-    static LIMITER: OnceLock<Arc<AdaptiveConcurrencyLimiter>> = OnceLock::new();
-    LIMITER
-        .get_or_init(|| AdaptiveConcurrencyLimiter::new(2, 4))
+fn claude_desktop_capacity_notify() -> &'static Notify {
+    static NOTIFY: OnceLock<Notify> = OnceLock::new();
+    NOTIFY.get_or_init(Notify::new)
+}
+
+fn claude_desktop_upstream_limiter(provider_id: &str) -> Arc<AdaptiveConcurrencyLimiter> {
+    static LIMITERS: OnceLock<std::sync::Mutex<HashMap<String, Arc<AdaptiveConcurrencyLimiter>>>> =
+        OnceLock::new();
+    let mut limiters = LIMITERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("claude desktop limiter registry lock poisoned");
+    limiters
+        .entry(provider_id.to_string())
+        // 每家从 1 开始；有排队压力且没有 429 时最多升到 2。三家队列
+        // 合计最多 6 条在途，既覆盖 Claude 的前台 + 后台 Agent，又不重现
+        // 旧版单家瞬间堆到 4 后连续 429 的并发风暴。
+        .or_insert_with(|| AdaptiveConcurrencyLimiter::new(1, 2))
         .clone()
-}
-
-pub(crate) fn mark_claude_desktop_stream_success() {
-    claude_desktop_upstream_limiter().mark_success();
-}
-
-pub(crate) fn note_claude_desktop_stream_error(message: &str) {
-    if text_has_rate_limit_signal(&message.to_ascii_lowercase()) {
-        claude_desktop_upstream_limiter().mark_rate_limited(std::time::Duration::from_secs(30));
-    }
 }
 
 impl Drop for ActiveConnectionGuard {
@@ -493,13 +787,16 @@ impl RequestForwarder {
         &self,
         provider: &Provider,
         app_type: &str,
-        permit: AllowResult,
-        mark_aimd_success: bool,
+        circuit_permit: &mut CircuitPermitGuard,
+        aimd_permit: Option<&AdaptiveConcurrencyPermit>,
     ) {
-        self.record_success_result(&provider.id, app_type, permit)
+        self.record_success_result(&provider.id, app_type, circuit_permit.permit())
             .await;
-        if mark_aimd_success && app_type == AppType::ClaudeDesktop.as_str() {
-            claude_desktop_upstream_limiter().mark_success();
+        circuit_permit.disarm();
+        if app_type == AppType::ClaudeDesktop.as_str() {
+            if let Some(permit) = aimd_permit {
+                permit.mark_success();
+            }
         }
 
         {
@@ -547,6 +844,25 @@ impl RequestForwarder {
         });
     }
 
+    fn stream_provider_outcome(
+        &self,
+        provider: &Provider,
+        app_type: &str,
+        permit: AllowResult,
+    ) -> StreamProviderOutcome {
+        StreamProviderOutcome {
+            router: self.router.clone(),
+            status: self.status.clone(),
+            current_providers: self.current_providers.clone(),
+            failover_manager: self.failover_manager.clone(),
+            app_handle: self.app_handle.clone(),
+            current_provider_id_at_start: self.current_provider_id_at_start.clone(),
+            provider: provider.clone(),
+            app_type: app_type.to_string(),
+            circuit_permit: Some(permit),
+        }
+    }
+
     /// 整流（thinking signature 或 budget）重试失败后的统一收尾。
     ///
     /// `None` 表示已记录熔断器、累积 `last_error`/`last_provider`，
@@ -559,7 +875,7 @@ impl RequestForwarder {
         retry_err: ProxyError,
         provider: &Provider,
         app_type_str: &str,
-        permit: AllowResult,
+        circuit_permit: &mut CircuitPermitGuard,
         rectifier_label: &str,
         last_error: &mut Option<ProxyError>,
         last_provider: &mut Option<Provider>,
@@ -578,11 +894,12 @@ impl RequestForwarder {
                 .record_result(
                     &provider.id,
                     app_type_str,
-                    permit,
+                    circuit_permit.permit(),
                     false,
                     Some(retry_err.to_string()),
                 )
                 .await;
+            circuit_permit.disarm();
             {
                 let mut status = self.status.write().await;
                 status.last_error = Some(format!(
@@ -596,8 +913,9 @@ impl RequestForwarder {
         }
 
         self.router
-            .release_permit_neutral(&provider.id, app_type_str, permit)
+            .release_permit_neutral(&provider.id, app_type_str, circuit_permit.permit())
             .await;
+        circuit_permit.disarm();
         let mut status = self.status.write().await;
         status.failed_requests += 1;
         status.last_error = Some(retry_err.to_string());
@@ -644,7 +962,7 @@ impl RequestForwarder {
         // Err 路径：guard 在函数 scope 内随返回值落地时自动 drop。
         match result {
             Ok(mut fr) => {
-                guard.attach_upstream_permit(fr.upstream_permit.take());
+                guard.attach_upstream_permit(fr.upstream_permit.take(), fr.stream_outcome.take());
                 fr.connection_guard = Some(guard);
                 Ok(fr)
             }
@@ -681,6 +999,7 @@ impl RequestForwarder {
             provider: None,
         })?;
         let app_type_str = app_type.as_str();
+        let client_requested_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
         if providers.is_empty() {
             return Err(ForwardError {
@@ -700,10 +1019,23 @@ impl RequestForwarder {
         // max_retries 仍有剩余额度时可进入下一轮，而不是立即把错误交回 Claude
         // 触发它自己的 10 次指数退避重试。
         let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let capacity_wait_started = std::time::Instant::now();
+        let mut consecutive_capacity_skips = 0usize;
+        let max_schedule_slots = if matches!(app_type, AppType::ClaudeDesktop) {
+            // AIMD 饱和跳过不算真实 attempt；额外调度槽只用于等待其它 Provider
+            // 释放容量，真实出站次数仍严格受 max_attempts 限制。
+            self.max_attempts
+                .saturating_add(providers.len().saturating_mul(512))
+        } else {
+            self.max_attempts
+        };
         // cycle 只扩展到 max_attempts，因此是有界的；当重试额度大于队列长度时，
         // 后续槽位形成第二轮 Provider 尝试。
-        for (schedule_index, provider) in
-            providers.iter().cycle().take(self.max_attempts).enumerate()
+        for (schedule_index, provider) in providers
+            .iter()
+            .cycle()
+            .take(max_schedule_slots)
+            .enumerate()
         {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
@@ -735,6 +1067,22 @@ impl RequestForwarder {
                 if schedule_index < providers.len() {
                     continue;
                 }
+                let mut all_candidates_rate_limited = true;
+                for candidate in &providers {
+                    if !self
+                        .router
+                        .is_provider_rate_limited(&candidate.id, app_type_str)
+                        .await
+                    {
+                        all_candidates_rate_limited = false;
+                        break;
+                    }
+                }
+                if !all_candidates_rate_limited {
+                    // 另一家只是 AIMD/熔断器暂时占用时继续扫描，不因当前这家
+                    // cooldown 把整个候选队列一起 sleep。
+                    continue;
+                }
                 let Some(delay) = self
                     .router
                     .earliest_rate_limit_retry_delay(&providers, app_type_str)
@@ -758,8 +1106,8 @@ impl RequestForwarder {
                 {
                     continue;
                 }
-            } else if schedule_index >= providers.len() {
-                let retry_round = schedule_index / providers.len();
+            } else if attempted_providers >= providers.len() {
+                let retry_round = attempted_providers / providers.len();
                 let backoff = std::time::Duration::from_millis(
                     (retry_round as u64).saturating_mul(500).min(2_000),
                 );
@@ -769,6 +1117,44 @@ impl RequestForwarder {
                     tokio::time::sleep(backoff).await;
                 }
             }
+
+            // 每个 Provider 有独立 AIMD 窗口。某家被长流占满时立即检查下一家，
+            // 而不是在全局队列里无限等待；所有候选都满时等待释放通知，并在没有
+            // 429 的前提下按排队压力每秒最多扩一格，单家硬上限仍是 2。
+            let upstream_permit = if matches!(app_type, AppType::ClaudeDesktop) {
+                let limiter = claude_desktop_upstream_limiter(&provider.id);
+                let permit = limiter.try_acquire().or_else(|| {
+                    (capacity_wait_started.elapsed() >= std::time::Duration::from_secs(1))
+                        .then(|| {
+                            limiter.try_acquire_under_pressure(std::time::Duration::from_secs(1))
+                        })
+                        .flatten()
+                });
+                let Some(permit) = permit else {
+                    consecutive_capacity_skips = consecutive_capacity_skips.saturating_add(1);
+                    if consecutive_capacity_skips >= providers.len() {
+                        consecutive_capacity_skips = 0;
+                        let now = std::time::Instant::now();
+                        if now >= retry_deadline {
+                            log::warn!(
+                                "[claude-desktop] 所有 Provider 并发窗口持续饱和 45 秒，停止 admission 等待"
+                            );
+                            break;
+                        }
+                        let notified = claude_desktop_capacity_notify().notified();
+                        let pause = std::time::Duration::from_millis(100)
+                            .min(retry_deadline.saturating_duration_since(now));
+                        tokio::select! {
+                            _ = notified => {}
+                            _ = tokio::time::sleep(pause) => {}
+                        }
+                    }
+                    continue;
+                };
+                Some(permit)
+            } else {
+                None
+            };
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
             // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
@@ -780,6 +1166,13 @@ impl RequestForwarder {
             if !permit.allowed {
                 continue;
             }
+            consecutive_capacity_skips = 0;
+            let mut circuit_permit = CircuitPermitGuard::new(
+                self.router.clone(),
+                provider.id.clone(),
+                app_type_str.to_string(),
+                permit,
+            );
 
             // PRE-SEND 优化器：每个 provider 独立决定是否优化
             // clone body 以避免 Bedrock 优化字段泄漏到非 Bedrock provider（failover 场景）
@@ -796,24 +1189,6 @@ impl RequestForwarder {
                 } else {
                     body.clone()
                 };
-
-            // AIMD 许可只覆盖真正的上游 attempt。Provider cooldown、候选选择和
-            // 请求前处理均不占槽；失败路径在本轮结束时立即释放，成功流则随
-            // ForwardResult 移交给下游生命周期 guard。
-            let upstream_permit = if matches!(app_type, AppType::ClaudeDesktop) {
-                let queued_at = std::time::Instant::now();
-                let permit = claude_desktop_upstream_limiter().acquire().await;
-                if queued_at.elapsed() >= std::time::Duration::from_millis(10) {
-                    log::info!(
-                        "[claude-desktop] 上游 attempt 排队 {}ms（当前并发上限={}）",
-                        queued_at.elapsed().as_millis(),
-                        permit.acquired_limit
-                    );
-                }
-                Some(permit)
-            } else {
-                None
-            };
 
             attempted_providers += 1;
 
@@ -843,9 +1218,30 @@ impl RequestForwarder {
                 .await
             {
                 Ok((response, claude_api_format, outbound_model)) => {
-                    let mark_aimd_success = !response.is_sse();
-                    self.finish_success(provider, app_type_str, permit, mark_aimd_success)
+                    let defer_stream_outcome = should_defer_claude_desktop_stream_outcome(
+                        app_type,
+                        client_requested_stream,
+                        &response,
+                        claude_api_format.as_deref(),
+                    );
+                    let stream_outcome = if defer_stream_outcome {
+                        let outcome = self.stream_provider_outcome(
+                            provider,
+                            app_type_str,
+                            circuit_permit.permit(),
+                        );
+                        circuit_permit.disarm();
+                        Some(outcome)
+                    } else {
+                        self.finish_success(
+                            provider,
+                            app_type_str,
+                            &mut circuit_permit,
+                            upstream_permit.as_ref(),
+                        )
                         .await;
+                        None
+                    };
 
                     return Ok(ForwardResult {
                         response,
@@ -854,6 +1250,7 @@ impl RequestForwarder {
                         outbound_model,
                         connection_guard: None,
                         upstream_permit,
+                        stream_outcome,
                     });
                 }
                 Err(e) => {
@@ -907,14 +1304,31 @@ impl RequestForwarder {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
-                                    let mark_aimd_success = !response.is_sse();
-                                    self.finish_success(
-                                        provider,
-                                        app_type_str,
-                                        permit,
-                                        mark_aimd_success,
-                                    )
-                                    .await;
+                                    let defer_stream_outcome =
+                                        should_defer_claude_desktop_stream_outcome(
+                                            app_type,
+                                            client_requested_stream,
+                                            &response,
+                                            claude_api_format.as_deref(),
+                                        );
+                                    let stream_outcome = if defer_stream_outcome {
+                                        let outcome = self.stream_provider_outcome(
+                                            provider,
+                                            app_type_str,
+                                            circuit_permit.permit(),
+                                        );
+                                        circuit_permit.disarm();
+                                        Some(outcome)
+                                    } else {
+                                        self.finish_success(
+                                            provider,
+                                            app_type_str,
+                                            &mut circuit_permit,
+                                            upstream_permit.as_ref(),
+                                        )
+                                        .await;
+                                        None
+                                    };
 
                                     return Ok(ForwardResult {
                                         response,
@@ -923,6 +1337,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         connection_guard: None,
                                         upstream_permit,
+                                        stream_outcome,
                                     });
                                 }
                                 Err(retry_err) => {
@@ -934,7 +1349,7 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            permit,
+                                            &mut circuit_permit,
                                             "media 降级",
                                             &mut last_error,
                                             &mut last_provider,
@@ -960,8 +1375,13 @@ impl RequestForwarder {
                                 log::warn!("[{app_type_str}] [RECT-005] 整流器已触发过，不再重试");
                                 // 释放 HalfOpen permit（不记录熔断器，这是客户端兼容性问题）
                                 self.router
-                                    .release_permit_neutral(&provider.id, app_type_str, permit)
+                                    .release_permit_neutral(
+                                        &provider.id,
+                                        app_type_str,
+                                        circuit_permit.permit(),
+                                    )
                                     .await;
+                                circuit_permit.disarm();
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
                                 status.last_error = Some(e.to_string());
@@ -1013,14 +1433,31 @@ impl RequestForwarder {
                                 {
                                     Ok((response, claude_api_format, outbound_model)) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
-                                        let mark_aimd_success = !response.is_sse();
-                                        self.finish_success(
-                                            provider,
-                                            app_type_str,
-                                            permit,
-                                            mark_aimd_success,
-                                        )
-                                        .await;
+                                        let defer_stream_outcome =
+                                            should_defer_claude_desktop_stream_outcome(
+                                                app_type,
+                                                client_requested_stream,
+                                                &response,
+                                                claude_api_format.as_deref(),
+                                            );
+                                        let stream_outcome = if defer_stream_outcome {
+                                            let outcome = self.stream_provider_outcome(
+                                                provider,
+                                                app_type_str,
+                                                circuit_permit.permit(),
+                                            );
+                                            circuit_permit.disarm();
+                                            Some(outcome)
+                                        } else {
+                                            self.finish_success(
+                                                provider,
+                                                app_type_str,
+                                                &mut circuit_permit,
+                                                upstream_permit.as_ref(),
+                                            )
+                                            .await;
+                                            None
+                                        };
 
                                         return Ok(ForwardResult {
                                             response,
@@ -1029,6 +1466,7 @@ impl RequestForwarder {
                                             outbound_model,
                                             connection_guard: None,
                                             upstream_permit,
+                                            stream_outcome,
                                         });
                                     }
                                     Err(retry_err) => {
@@ -1040,7 +1478,7 @@ impl RequestForwarder {
                                                 retry_err,
                                                 provider,
                                                 app_type_str,
-                                                permit,
+                                                &mut circuit_permit,
                                                 "整流",
                                                 &mut last_error,
                                                 &mut last_provider,
@@ -1069,8 +1507,13 @@ impl RequestForwarder {
                                     "[{app_type_str}] [RECT-013] budget 整流器已触发过，不再重试"
                                 );
                                 self.router
-                                    .release_permit_neutral(&provider.id, app_type_str, permit)
+                                    .release_permit_neutral(
+                                        &provider.id,
+                                        app_type_str,
+                                        circuit_permit.permit(),
+                                    )
                                     .await;
+                                circuit_permit.disarm();
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
                                 status.last_error = Some(e.to_string());
@@ -1091,8 +1534,13 @@ impl RequestForwarder {
                                     "[{app_type_str}] [RECT-014] budget 整流器触发但无可整流内容，不做无意义重试"
                                 );
                                 self.router
-                                    .release_permit_neutral(&provider.id, app_type_str, permit)
+                                    .release_permit_neutral(
+                                        &provider.id,
+                                        app_type_str,
+                                        circuit_permit.permit(),
+                                    )
                                     .await;
+                                circuit_permit.disarm();
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
                                 status.last_error = Some(e.to_string());
@@ -1132,14 +1580,31 @@ impl RequestForwarder {
                             {
                                 Ok((response, claude_api_format, outbound_model)) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
-                                    let mark_aimd_success = !response.is_sse();
-                                    self.finish_success(
-                                        provider,
-                                        app_type_str,
-                                        permit,
-                                        mark_aimd_success,
-                                    )
-                                    .await;
+                                    let defer_stream_outcome =
+                                        should_defer_claude_desktop_stream_outcome(
+                                            app_type,
+                                            client_requested_stream,
+                                            &response,
+                                            claude_api_format.as_deref(),
+                                        );
+                                    let stream_outcome = if defer_stream_outcome {
+                                        let outcome = self.stream_provider_outcome(
+                                            provider,
+                                            app_type_str,
+                                            circuit_permit.permit(),
+                                        );
+                                        circuit_permit.disarm();
+                                        Some(outcome)
+                                    } else {
+                                        self.finish_success(
+                                            provider,
+                                            app_type_str,
+                                            &mut circuit_permit,
+                                            upstream_permit.as_ref(),
+                                        )
+                                        .await;
+                                        None
+                                    };
 
                                     return Ok(ForwardResult {
                                         response,
@@ -1148,6 +1613,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         connection_guard: None,
                                         upstream_permit,
+                                        stream_outcome,
                                     });
                                 }
                                 Err(retry_err) => {
@@ -1159,7 +1625,7 @@ impl RequestForwarder {
                                             retry_err,
                                             provider,
                                             app_type_str,
-                                            permit,
+                                            &mut circuit_permit,
                                             "budget 整流",
                                             &mut last_error,
                                             &mut last_provider,
@@ -1176,8 +1642,13 @@ impl RequestForwarder {
 
                     if signature_rectifier_non_retryable_client_error {
                         self.router
-                            .release_permit_neutral(&provider.id, app_type_str, permit)
+                            .release_permit_neutral(
+                                &provider.id,
+                                app_type_str,
+                                circuit_permit.permit(),
+                            )
                             .await;
+                        circuit_permit.disarm();
                         let mut status = self.status.write().await;
                         status.failed_requests += 1;
                         status.last_error = Some(e.to_string());
@@ -1207,8 +1678,9 @@ impl RequestForwarder {
                                 {
                                     Ok(cooldown) => {
                                         if app_type_str == AppType::ClaudeDesktop.as_str() {
-                                            claude_desktop_upstream_limiter()
-                                                .mark_rate_limited(cooldown);
+                                            if let Some(permit) = upstream_permit.as_ref() {
+                                                permit.mark_rate_limited(cooldown);
+                                            }
                                         }
                                     }
                                     Err(error) => log::warn!(
@@ -1223,11 +1695,12 @@ impl RequestForwarder {
                                 .record_result(
                                     &provider.id,
                                     app_type_str,
-                                    permit,
+                                    circuit_permit.permit(),
                                     false,
                                     Some(e.to_string()),
                                 )
                                 .await;
+                            circuit_permit.disarm();
 
                             {
                                 let mut status = self.status.write().await;
@@ -1251,8 +1724,13 @@ impl RequestForwarder {
                         ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
                             // 不可重试：客户端层错误或客户端断连 → 不污染健康度，仅释放 HalfOpen permit
                             self.router
-                                .release_permit_neutral(&provider.id, app_type_str, permit)
+                                .release_permit_neutral(
+                                    &provider.id,
+                                    app_type_str,
+                                    circuit_permit.permit(),
+                                )
                                 .await;
+                            circuit_permit.disarm();
                             {
                                 let mut status = self.status.write().await;
                                 status.failed_requests += 1;
@@ -2551,17 +3029,28 @@ impl RequestForwarder {
         let status = response.status();
 
         if status.is_success() {
-            let mut response = self
-                .prepare_success_response_for_failover(response, request_is_streaming)
-                .await?;
+            let claude_desktop_anthropic_stream = matches!(app_type, AppType::ClaudeDesktop)
+                && request_is_streaming
+                && matches!(
+                    resolved_claude_api_format.as_deref(),
+                    None | Some("anthropic")
+                );
+            let mut response = if claude_desktop_anthropic_stream {
+                // 不信任 Content-Type：部分兼容网关会把 SSE 错标为 JSON。验证器
+                // 同时识别完整 JSON 文档与 SSE，并在确认 SSE 后修正响应头。
+                // message_start / ping 仍处于可故障转移阶段；只有出现首个有效文本
+                // 或合法终止事件后才提交给 Claude。
+                self.validate_anthropic_stream_start(response).await?
+            } else {
+                self.prepare_success_response_for_failover(response, request_is_streaming)
+                    .await?
+            };
             // Streaming requests normally return SSE. If a compatible gateway
             // explicitly returns JSON instead, buffer and validate it inside the retry
             // loop as well so a 2xx Anthropic error envelope can still fail over. Do
             // not buffer unknown content types: some gateways omit the SSE header.
             if codex_responses_to_anthropic && (!request_is_streaming || response.is_json()) {
-                response = self
-                    .validate_codex_anthropic_success_response(response)
-                    .await?;
+                response = self.validate_anthropic_success_response(response).await?;
             } else if matches!(
                 resolved_claude_api_format.as_deref(),
                 Some("openai_responses")
@@ -2644,7 +3133,7 @@ impl RequestForwarder {
     /// Some Anthropic-compatible gateways return an Anthropic error envelope with
     /// HTTP 2xx. Validate it inside the retry loop so the request can fail over to
     /// the next provider; the response transformer runs too late for that.
-    async fn validate_codex_anthropic_success_response(
+    async fn validate_anthropic_success_response(
         &self,
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
@@ -2696,6 +3185,99 @@ impl RequestForwarder {
         }
 
         Ok(ProxyResponse::buffered(status, headers, raw))
+    }
+
+    /// 在仍可切换 Provider 的阶段检查 Anthropic SSE 起始事件。
+    ///
+    /// 生命周期事件（message_start / ping / content_block_start）先暂存；首个真正
+    /// 的内容 delta 或合法终止事件出现后才提交。若在此之前收到 HTTP 200 内嵌的
+    /// `event:error`，把它转成可重试错误，由外层 failover loop 尝试下一家。
+    async fn validate_anthropic_stream_start(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        const MAX_PRIME_BYTES: usize = 256 * 1024;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut stream = Box::pin(response.bytes_stream());
+        let mut replay_chunks: Vec<Bytes> = Vec::new();
+        let mut parse_buffer = String::new();
+        let mut utf8_remainder = Vec::new();
+        let mut primed_bytes = 0usize;
+        let semantic_deadline = (!self.streaming_first_byte_timeout.is_zero())
+            .then(|| std::time::Instant::now() + self.streaming_first_byte_timeout);
+
+        loop {
+            let next = match semantic_deadline {
+                None => stream.next().await,
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(ProxyError::Timeout(format!(
+                            "Anthropic stream produced no semantic output within {}s",
+                            self.streaming_first_byte_timeout.as_secs()
+                        )));
+                    }
+                    tokio::time::timeout(remaining, stream.next())
+                        .await
+                        .map_err(|_| {
+                            ProxyError::Timeout(format!(
+                                "Anthropic stream produced no semantic output within {}s",
+                                self.streaming_first_byte_timeout.as_secs()
+                            ))
+                        })?
+                }
+            };
+
+            let Some(chunk) = next else {
+                return Err(ProxyError::ForwardFailed(
+                    "Anthropic stream ended before producing output or message_stop".to_string(),
+                ));
+            };
+            let chunk = chunk.map_err(|error| {
+                ProxyError::ForwardFailed(format!(
+                    "Failed while validating Anthropic stream start: {error}"
+                ))
+            })?;
+            crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
+            primed_bytes = primed_bytes.saturating_add(chunk.len());
+            replay_chunks.push(chunk);
+
+            if let Some(outcome) = inspect_anthropic_json_document(&parse_buffer) {
+                outcome?;
+                let body = replay_chunks
+                    .into_iter()
+                    .fold(Vec::new(), |mut all, bytes| {
+                        all.extend_from_slice(&bytes);
+                        all
+                    });
+                return Ok(ProxyResponse::buffered(status, headers, Bytes::from(body)));
+            }
+
+            let mut safe_to_commit = false;
+            while let Some(block) = crate::proxy::sse::take_sse_block(&mut parse_buffer) {
+                if let Some(outcome) = inspect_anthropic_start_event(&block) {
+                    outcome?;
+                    safe_to_commit = true;
+                }
+            }
+            if safe_to_commit {
+                let mut headers = headers;
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/event-stream"),
+                );
+                let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+                return Ok(ProxyResponse::streamed(status, headers, replay));
+            }
+
+            if primed_bytes >= MAX_PRIME_BYTES {
+                return Err(ProxyError::ForwardFailed(format!(
+                    "Anthropic stream produced {MAX_PRIME_BYTES} bytes without valid semantic output"
+                )));
+            }
+        }
     }
 
     async fn validate_responses_stream_start(
@@ -3002,6 +3584,19 @@ fn text_has_rate_limit_signal(text: &str) -> bool {
     ]
     .iter()
     .any(|signal| text.contains(signal))
+}
+
+fn should_defer_claude_desktop_stream_outcome(
+    app_type: &AppType,
+    client_requested_stream: bool,
+    response: &ProxyResponse,
+    claude_api_format: Option<&str>,
+) -> bool {
+    if !matches!(app_type, AppType::ClaudeDesktop) || !client_requested_stream {
+        return false;
+    }
+    response.is_sse()
+        || claude_api_format.is_some_and(super::providers::claude_api_format_needs_transform)
 }
 
 fn effective_response_header_timeout(
@@ -3322,6 +3917,88 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
         ))));
     }
     Some(Ok(()))
+}
+
+fn inspect_anthropic_json_document(buffer: &str) -> Option<Result<(), ProxyError>> {
+    let trimmed = buffer.trim();
+    if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
+        return None;
+    }
+    let _: Value = serde_json::from_str(trimmed).ok()?;
+    if let Some(message) = codex_anthropic_error_envelope_message(trimmed.as_bytes()) {
+        return Some(Err(ProxyError::TransformError(format!(
+            "Anthropic upstream returned a 2xx failure: {message}"
+        ))));
+    }
+    Some(Ok(()))
+}
+
+/// Inspect one complete Anthropic SSE block before any bytes are exposed to Claude.
+/// Lifecycle-only events keep priming; productive output/terminal events commit the
+/// replay buffer; an error remains inside the retry loop and can fail over safely.
+fn inspect_anthropic_start_event(block: &str) -> Option<Result<(), ProxyError>> {
+    let mut named_event = None;
+    let mut data_lines = Vec::new();
+    for line in block.lines() {
+        if let Some(event) = crate::proxy::sse::strip_sse_field(line, "event") {
+            named_event = Some(event.trim().to_string());
+        } else if let Some(data) = crate::proxy::sse::strip_sse_field(line, "data") {
+            data_lines.push(data);
+        }
+    }
+    if data_lines.is_empty() {
+        return None;
+    }
+    let value: Value = match serde_json::from_str(&data_lines.join("\n")) {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+    let event = named_event
+        .as_deref()
+        .filter(|event| !event.is_empty())
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .unwrap_or("");
+
+    if event == "error" || value.get("error").is_some_and(|error| !error.is_null()) {
+        let error = value.get("error").unwrap_or(&value);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.as_str())
+            .unwrap_or("Anthropic upstream emitted an error before output");
+        let error_type = error
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| error.get("code").and_then(Value::as_str))
+            .unwrap_or("upstream_error");
+        return Some(Err(ProxyError::ForwardFailed(format!(
+            "Anthropic upstream {error_type}: {message}"
+        ))));
+    }
+
+    match event {
+        // These events carry no user-visible output and remain failover-safe.
+        "message_start" | "ping" | "content_block_start" | "content_block_stop" | "" => None,
+        "content_block_delta" => {
+            let delta_type = value.pointer("/delta/type").and_then(Value::as_str);
+            let has_text = delta_type == Some("text_delta")
+                && value
+                    .pointer("/delta/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty());
+            has_text.then_some(Ok(()))
+        }
+        "message_delta" => value
+            .pointer("/delta/stop_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+            .then_some(Ok(())),
+        "message_stop" => Some(Ok(())),
+        // Unknown extensions and non-text deltas remain buffered. A valid standard
+        // Anthropic stream will eventually produce text or a terminal event; an early
+        // error therefore remains failover-safe.
+        _ => None,
+    }
 }
 
 /// Inspect one complete Responses SSE block while the response is still inside
@@ -4062,6 +4739,113 @@ mod tests {
     }
 
     #[test]
+    fn claude_desktop_limiter_expands_on_pressure_but_not_during_429_cooldown() {
+        let limiter = AdaptiveConcurrencyLimiter::new(1, 3);
+        let first = limiter.try_acquire().expect("initial slot");
+        assert!(limiter.try_acquire().is_none());
+
+        let second = limiter
+            .try_acquire_under_pressure(Duration::ZERO)
+            .expect("queue pressure should open one slot");
+        assert_eq!(limiter.current_limit(), 2);
+
+        limiter.mark_rate_limited(Duration::from_secs(1));
+        assert_eq!(limiter.current_limit(), 1);
+        assert!(
+            limiter.try_acquire_under_pressure(Duration::ZERO).is_none(),
+            "429 cooldown must suppress pressure-based expansion"
+        );
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn claude_desktop_capacity_isolated_per_provider() {
+        let first_provider = claude_desktop_upstream_limiter("test-capacity-provider-a");
+        let second_provider = claude_desktop_upstream_limiter("test-capacity-provider-b");
+        let first = first_provider.try_acquire().expect("provider A slot");
+        assert!(
+            first_provider.try_acquire().is_none(),
+            "provider A should be saturated at its initial window"
+        );
+        let second = second_provider
+            .try_acquire()
+            .expect("provider B must remain independently available");
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn cancelled_attempt_guard_releases_half_open_probe() {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        db.update_circuit_breaker_config(&crate::proxy::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("circuit config");
+        let provider = test_provider_with_type(Some("anthropic"));
+        db.save_provider("claude", &provider)
+            .expect("save provider");
+        let router = Arc::new(ProviderRouter::new(db));
+
+        let failure = router
+            .begin_provider_request(&provider.id, "claude", false)
+            .await;
+        router
+            .record_result(
+                &provider.id,
+                "claude",
+                failure,
+                false,
+                Some("open breaker".to_string()),
+            )
+            .await
+            .expect("record failure");
+
+        let half_open = router
+            .begin_provider_request(&provider.id, "claude", false)
+            .await;
+        assert!(half_open.allowed && half_open.used_half_open_permit);
+        drop(CircuitPermitGuard::new(
+            router.clone(),
+            provider.id.clone(),
+            "claude".to_string(),
+            half_open,
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let next = router
+            .begin_provider_request(&provider.id, "claude", false)
+            .await;
+        assert!(next.allowed && next.used_half_open_permit);
+        router
+            .release_permit_neutral(&provider.id, "claude", next)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_success_is_committed_only_at_terminal_event() {
+        let forwarder = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+        let provider = test_provider_with_type(Some("anthropic"));
+        {
+            let mut status = forwarder.status.write().await;
+            status.total_requests = 1;
+        }
+        let permit = forwarder
+            .router
+            .begin_provider_request(&provider.id, "claude-desktop", true)
+            .await;
+        let mut outcome = forwarder.stream_provider_outcome(&provider, "claude-desktop", permit);
+
+        assert_eq!(forwarder.status.read().await.success_requests, 0);
+        outcome.finish_success().await;
+        assert_eq!(forwarder.status.read().await.success_requests, 1);
+        assert!(outcome.circuit_permit.is_none());
+    }
+
+    #[test]
     fn single_provider_retryable_log_uses_single_provider_code() {
         let error = ProxyError::UpstreamError {
             status: 429,
@@ -4116,6 +4900,27 @@ mod tests {
             effective_response_header_timeout(true, Duration::ZERO, non_streaming),
             non_streaming
         );
+    }
+
+    #[test]
+    fn transformed_desktop_stream_defers_outcome_even_when_sse_header_is_missing() {
+        let response = ProxyResponse::buffered(
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from_static(b"data: {\"choices\":[]}"),
+        );
+        assert!(should_defer_claude_desktop_stream_outcome(
+            &AppType::ClaudeDesktop,
+            true,
+            &response,
+            Some("openai_chat"),
+        ));
+        assert!(!should_defer_claude_desktop_stream_outcome(
+            &AppType::ClaudeDesktop,
+            true,
+            &response,
+            Some("anthropic"),
+        ));
     }
 
     #[test]
@@ -4437,6 +5242,92 @@ mod tests {
         };
 
         assert!(matches!(err, ProxyError::ForwardFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn anthropic_200_sse_error_is_retryable_before_downstream_commit() {
+        let forwarder = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+        let response = ProxyResponse::streamed(
+            StatusCode::OK,
+            HeaderMap::new(),
+            futures::stream::iter(vec![
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
+                )),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too many pending requests, please retry later\"}}\n\n",
+                )),
+            ]),
+        );
+
+        let err = match forwarder.validate_anthropic_stream_start(response).await {
+            Ok(_) => panic!("pre-output SSE error must stay inside failover loop"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ProxyError::ForwardFailed(message)
+                if message.contains("Too many pending requests")
+        ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_empty_delta_does_not_commit_before_following_error() {
+        let forwarder = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+        let response = ProxyResponse::streamed(
+            StatusCode::OK,
+            HeaderMap::new(),
+            futures::stream::iter(vec![
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}\n\n",
+                )),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Please retry later\"}}\n\n",
+                )),
+            ]),
+        );
+        let err = match forwarder.validate_anthropic_stream_start(response).await {
+            Ok(_) => panic!("empty delta must not commit the downstream response"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            ProxyError::ForwardFailed(message)
+                if message.contains("rate_limit_error") && message.contains("Please retry later")
+        ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_start_replays_lifecycle_after_first_delta() {
+        let forwarder = test_forwarder(Duration::from_secs(1), Duration::from_secs(1));
+        let response = ProxyResponse::streamed(
+            StatusCode::OK,
+            HeaderMap::new(),
+            futures::stream::iter(vec![
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
+                )),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+                )),
+            ]),
+        );
+
+        let prepared = forwarder
+            .validate_anthropic_stream_start(response)
+            .await
+            .expect("first productive delta should commit replay");
+        assert!(
+            prepared.is_sse(),
+            "validator must repair a missing/incorrect SSE content type"
+        );
+        let body = prepared
+            .bytes_with_limit(MAX_RESPONSE_BODY_BYTES)
+            .await
+            .expect("replayed stream");
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("message_start"), "{text}");
+        assert!(text.contains("hello"), "{text}");
     }
 
     #[test]
@@ -4776,6 +5667,31 @@ mod tests {
             br#"{"status":"completed","error":null,"output":[]}"#
         )
         .is_none());
+    }
+
+    #[test]
+    fn anthropic_stream_start_holds_lifecycle_and_rejects_200_sse_error() {
+        let message_start = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}"
+        );
+        assert!(inspect_anthropic_start_event(message_start).is_none());
+
+        let pending = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too many pending requests, please retry later\"}}"
+        );
+        assert!(matches!(
+            inspect_anthropic_start_event(pending),
+            Some(Err(ProxyError::ForwardFailed(message)))
+                if message.contains("Too many pending requests")
+        ));
+
+        let delta = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+        );
+        assert!(matches!(inspect_anthropic_start_event(delta), Some(Ok(()))));
     }
 
     #[test]
