@@ -37,7 +37,7 @@ use http::Extensions;
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use tauri::Manager;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock};
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
@@ -131,7 +131,176 @@ pub struct ForwardError {
 /// 不需要每条出口路径都手动调用。
 pub(crate) struct ActiveConnectionGuard {
     status: Arc<RwLock<ProxyStatus>>,
-    _upstream_permit: Option<OwnedSemaphorePermit>,
+    _upstream_permit: Option<AdaptiveConcurrencyPermit>,
+}
+
+#[derive(Debug)]
+struct AdaptiveConcurrencyState {
+    active: usize,
+    limit: usize,
+    congestion_until: Option<std::time::Instant>,
+    successes_since_increase: u32,
+}
+
+struct AdaptiveConcurrencyLimiter {
+    min_limit: usize,
+    max_limit: usize,
+    successes_per_slot: u32,
+    state: std::sync::Mutex<AdaptiveConcurrencyState>,
+    notify: Notify,
+}
+
+impl AdaptiveConcurrencyLimiter {
+    fn new(initial_limit: usize, max_limit: usize) -> Arc<Self> {
+        let max_limit = max_limit.max(1);
+        let initial_limit = initial_limit.max(1).min(max_limit);
+        Arc::new(Self {
+            min_limit: 1,
+            max_limit,
+            successes_per_slot: 4,
+            state: std::sync::Mutex::new(AdaptiveConcurrencyState {
+                active: 0,
+                limit: initial_limit,
+                congestion_until: None,
+                successes_since_increase: 0,
+            }),
+            notify: Notify::new(),
+        })
+    }
+
+    fn current_limit_locked(
+        &self,
+        state: &mut AdaptiveConcurrencyState,
+        now: std::time::Instant,
+    ) -> usize {
+        if state.congestion_until.is_some_and(|until| until <= now) {
+            state.congestion_until = None;
+        }
+        state.limit
+    }
+
+    async fn acquire(self: &Arc<Self>) -> AdaptiveConcurrencyPermit {
+        loop {
+            let notified = self.notify.notified();
+            let (acquired_limit, wake_after) = {
+                let now = std::time::Instant::now();
+                let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+                let limit = self.current_limit_locked(&mut state, now);
+                if state.active < limit {
+                    state.active += 1;
+                    (Some(limit), None)
+                } else {
+                    (
+                        None,
+                        state
+                            .congestion_until
+                            .map(|until| until.saturating_duration_since(now)),
+                    )
+                }
+            };
+            if let Some(limit) = acquired_limit {
+                return AdaptiveConcurrencyPermit {
+                    limiter: self.clone(),
+                    acquired_limit: limit,
+                };
+            }
+            match wake_after {
+                Some(delay) if !delay.is_zero() => {
+                    tokio::select! {
+                        _ = notified => {},
+                        _ = tokio::time::sleep(delay) => {},
+                    }
+                }
+                _ => notified.await,
+            }
+        }
+    }
+
+    fn release(&self) {
+        {
+            let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+            state.active = state.active.saturating_sub(1);
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn mark_rate_limited(&self, cooldown: std::time::Duration) {
+        let until = std::time::Instant::now() + cooldown.max(std::time::Duration::from_millis(1));
+        let (previous_limit, new_limit) = {
+            let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+            let previous_limit = state.limit;
+            // AIMD: 发生拥塞时窗口乘法减小（向上取半），最低为 1。
+            state.limit = ((state.limit + 1) / 2).max(self.min_limit);
+            state.congestion_until = Some(
+                state
+                    .congestion_until
+                    .map(|current| current.max(until))
+                    .unwrap_or(until),
+            );
+            state.successes_since_increase = 0;
+            (previous_limit, state.limit)
+        };
+        log::warn!(
+            "[claude-desktop] 检测到 429，AIMD 并发窗口 {} → {}，{} 秒内禁止回升",
+            previous_limit,
+            new_limit,
+            cooldown.as_secs().max(1)
+        );
+        self.notify.notify_waiters();
+    }
+
+    fn mark_success(&self) {
+        let increased = {
+            let now = std::time::Instant::now();
+            let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+            if state.congestion_until.is_some_and(|until| until > now)
+                || state.limit >= self.max_limit
+            {
+                return;
+            }
+            state.congestion_until = None;
+            state.successes_since_increase = state.successes_since_increase.saturating_add(1);
+            let required = self
+                .successes_per_slot
+                .saturating_mul(state.limit as u32)
+                .max(1);
+            if state.successes_since_increase >= required {
+                let previous = state.limit;
+                state.limit = (state.limit + 1).min(self.max_limit);
+                state.successes_since_increase = 0;
+                Some((previous, state.limit, required))
+            } else {
+                None
+            }
+        };
+        if let Some((previous, next, required)) = increased {
+            log::info!(
+                "[claude-desktop] AIMD 累计 {} 次完整成功，并发窗口 {} → {}",
+                required,
+                previous,
+                next
+            );
+            self.notify.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    fn current_limit(&self) -> usize {
+        let now = std::time::Instant::now();
+        let mut state = self.state.lock().expect("adaptive limiter lock poisoned");
+        self.current_limit_locked(&mut state, now)
+    }
+}
+
+struct AdaptiveConcurrencyPermit {
+    limiter: Arc<AdaptiveConcurrencyLimiter>,
+    acquired_limit: usize,
+}
+
+impl Drop for AdaptiveConcurrencyPermit {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
 }
 
 impl ActiveConnectionGuard {
@@ -145,23 +314,22 @@ impl ActiveConnectionGuard {
 
     async fn acquire_with_limiter(
         status: Arc<RwLock<ProxyStatus>>,
-        limiter: Option<Arc<Semaphore>>,
+        limiter: Option<Arc<AdaptiveConcurrencyLimiter>>,
     ) -> Self {
         let queued_at = std::time::Instant::now();
         let upstream_permit = match limiter {
-            Some(limiter) => Some(
-                limiter
-                    .acquire_owned()
-                    .await
-                    .expect("Claude Desktop upstream semaphore is never closed"),
-            ),
+            Some(limiter) => Some(limiter.acquire().await),
             None => None,
         };
         if upstream_permit.is_some() && queued_at.elapsed() >= std::time::Duration::from_millis(10)
         {
             log::info!(
-                "[claude-desktop] 上游并发队列等待 {}ms（并发上限=1）",
-                queued_at.elapsed().as_millis()
+                "[claude-desktop] 上游并发队列等待 {}ms（当前并发上限={}）",
+                queued_at.elapsed().as_millis(),
+                upstream_permit
+                    .as_ref()
+                    .map(|permit| permit.acquired_limit)
+                    .unwrap_or(0)
             );
         }
         {
@@ -175,9 +343,11 @@ impl ActiveConnectionGuard {
     }
 }
 
-fn claude_desktop_upstream_limiter() -> Arc<Semaphore> {
-    static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    LIMITER.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
+fn claude_desktop_upstream_limiter() -> Arc<AdaptiveConcurrencyLimiter> {
+    static LIMITER: OnceLock<Arc<AdaptiveConcurrencyLimiter>> = OnceLock::new();
+    LIMITER
+        .get_or_init(|| AdaptiveConcurrencyLimiter::new(2, 4))
+        .clone()
 }
 
 impl Drop for ActiveConnectionGuard {
@@ -413,6 +583,9 @@ impl RequestForwarder {
     async fn finish_success(&self, provider: &Provider, app_type: &str, permit: AllowResult) {
         self.record_success_result(&provider.id, app_type, permit)
             .await;
+        if app_type == AppType::ClaudeDesktop.as_str() {
+            claude_desktop_upstream_limiter().mark_success();
+        }
 
         {
             let mut status = self.status.write().await;
@@ -1105,15 +1278,21 @@ impl RequestForwarder {
                     match category {
                         ErrorCategory::Retryable => {
                             if is_rate_limit_error(&e) {
-                                if let Err(error) = self
+                                match self
                                     .router
                                     .mark_provider_rate_limited(&provider.id, app_type_str)
                                     .await
                                 {
-                                    log::warn!(
+                                    Ok(cooldown) => {
+                                        if app_type_str == AppType::ClaudeDesktop.as_str() {
+                                            claude_desktop_upstream_limiter()
+                                                .mark_rate_limited(cooldown);
+                                        }
+                                    }
+                                    Err(error) => log::warn!(
                                         "[{app_type_str}] 记录供应商 {} 的速率限制冷却失败: {error}",
                                         provider.id
-                                    );
+                                    ),
                                 }
                             }
                             // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
@@ -3888,31 +4067,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_desktop_upstream_limiter_serializes_full_request_lifecycle() {
+    async fn claude_desktop_upstream_limiter_uses_aimd_window() {
         let status = Arc::new(RwLock::new(ProxyStatus::default()));
-        let limiter = Arc::new(Semaphore::new(1));
+        let limiter = AdaptiveConcurrencyLimiter::new(2, 4);
         let first =
             ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone()))
                 .await;
-        assert_eq!(limiter.available_permits(), 0);
+        let second =
+            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone()))
+                .await;
+        assert_eq!(limiter.current_limit(), 2);
 
         let blocked = tokio::time::timeout(
             Duration::from_millis(25),
             ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone())),
         )
         .await;
-        assert!(blocked.is_err(), "second request must wait for the first");
+        assert!(
+            blocked.is_err(),
+            "third request must wait for an active slot"
+        );
 
+        limiter.mark_rate_limited(Duration::from_millis(40));
+        assert_eq!(limiter.current_limit(), 1);
         drop(first);
-        let second = tokio::time::timeout(
+        let still_blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone())),
+        )
+        .await;
+        assert!(
+            still_blocked.is_err(),
+            "one remaining active request must fill the congested limit"
+        );
+
+        drop(second);
+        let third = tokio::time::timeout(
+            Duration::from_secs(1),
+            ActiveConnectionGuard::acquire_with_limiter(status.clone(), Some(limiter.clone())),
+        )
+        .await
+        .expect("third request should resume when congested active count reaches zero");
+
+        for _ in 0..8 {
+            limiter.mark_success();
+        }
+        assert_eq!(
+            limiter.current_limit(),
+            1,
+            "successes during cooldown must not reopen concurrency"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..4 {
+            limiter.mark_success();
+        }
+        assert_eq!(limiter.current_limit(), 2);
+        let fourth = tokio::time::timeout(
             Duration::from_secs(1),
             ActiveConnectionGuard::acquire_with_limiter(status, Some(limiter.clone())),
         )
         .await
-        .expect("second request should resume after first response lifecycle ends");
-        assert_eq!(limiter.available_permits(), 0);
-        drop(second);
-        assert_eq!(limiter.available_permits(), 1);
+        .expect("second slot should reopen additively after cooldown and successes");
+        for _ in 0..8 {
+            limiter.mark_success();
+        }
+        assert_eq!(limiter.current_limit(), 3);
+        drop(third);
+        drop(fourth);
     }
 
     #[tokio::test]
