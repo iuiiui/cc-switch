@@ -748,6 +748,7 @@ struct AnthropicTerminalState {
     saw_tool_use_block: bool,
     open_unsafe_content_blocks: HashSet<u64>,
     saw_invalid_non_text_block: bool,
+    silent_recovery_requested: bool,
 }
 
 struct HeldAnthropicContentBlock {
@@ -797,17 +798,10 @@ fn describe_anthropic_sse_block(block: &str) -> AnthropicEventDescriptor {
     }
 }
 
-fn incomplete_block_fallback_events(index: u64, block_type: &str) -> Vec<String> {
-    let message = format!(
-        "CC Switch 已保留本轮已生成内容；上游的 {block_type} 数据未完整结束，已安全取消该块。"
-    );
+fn incomplete_block_fallback_events(index: u64, _block_type: &str) -> Vec<String> {
     vec![
         format!(
             "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":{index},\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}"
-        ),
-        format!(
-            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}",
-            serde_json::to_string(&message).unwrap_or_else(|_| "\"upstream block incomplete\"".to_string())
         ),
         format!(
             "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":{index}}}"
@@ -833,7 +827,11 @@ fn materialize_incomplete_anthropic_blocks(
     held: &mut HashMap<u64, HeldAnthropicContentBlock>,
     state: &mut AnthropicTerminalState,
 ) -> Vec<Bytes> {
-    abandon_incomplete_anthropic_blocks(held)
+    let events = abandon_incomplete_anthropic_blocks(held);
+    if !events.is_empty() {
+        state.silent_recovery_requested = true;
+    }
+    events
         .into_iter()
         .map(|event| {
             observe_anthropic_sse_block(&event, state);
@@ -845,28 +843,26 @@ fn materialize_incomplete_anthropic_blocks(
         .collect()
 }
 
-fn ensure_anthropic_recovery_text(state: &mut AnthropicTerminalState, message: &str) -> Vec<Bytes> {
-    if state.saw_text_delta {
-        return Vec::new();
+fn ensure_anthropic_silent_recovery(state: &mut AnthropicTerminalState) -> Vec<Bytes> {
+    let mut events = Vec::new();
+    if !state.saw_message_start {
+        events.push(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cc_switch_recovery\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}".to_string(),
+        );
     }
-
-    let events = if let Some(index) = state
-        .open_content_blocks
-        .iter()
-        .find_map(|(index, block_type)| (block_type == "text").then_some(*index))
+    state.silent_recovery_requested = true;
+    if !state.saw_text_delta
+        && !state
+            .open_content_blocks
+            .values()
+            .any(|block_type| block_type == "text")
     {
-        vec![format!(
-            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}",
-            serde_json::to_string(message)
-                .unwrap_or_else(|_| "\"upstream stream incomplete\"".to_string())
-        )]
-    } else {
         let index = state
             .max_content_block_index
             .map(|current| current.saturating_add(1))
             .unwrap_or(0);
-        incomplete_block_fallback_events(index, "stream")
-    };
+        events.extend(incomplete_block_fallback_events(index, "stream"));
+    }
 
     events
         .into_iter()
@@ -1036,7 +1032,9 @@ fn anthropic_can_complete_safely(state: &AnthropicTerminalState) -> bool {
 
 fn anthropic_can_repair_truncated_turn(state: &AnthropicTerminalState) -> bool {
     state.saw_message_start
-        && ((state.saw_text_block && state.saw_text_delta) || state.saw_tool_use_block)
+        && ((state.saw_text_block && state.saw_text_delta)
+            || state.saw_tool_use_block
+            || state.silent_recovery_requested)
         && !state.saw_invalid_non_text_block
         && state.open_unsafe_content_blocks.is_empty()
         && !state.saw_error
@@ -1168,10 +1166,15 @@ pub fn create_logged_passthrough_stream(
                                 // 事件之前 Claude 就可能先解析到半截 JSON/UTF-8 并报错。
                                 buffer.clear();
                                 utf8_remainder.clear();
-                                let fallback_blocks = materialize_incomplete_anthropic_blocks(
+                                let mut fallback_blocks = materialize_incomplete_anthropic_blocks(
                                     &mut held_anthropic_blocks,
                                     &mut anthropic_state,
                                 );
+                                if terminal_policy.is_claude_desktop() {
+                                    fallback_blocks.extend(ensure_anthropic_silent_recovery(
+                                        &mut anthropic_state,
+                                    ));
+                                }
                                 let terminals = anthropic_terminal_chunks(
                                     &anthropic_state,
                                     "stream_timeout",
@@ -1253,6 +1256,7 @@ pub fn create_logged_passthrough_stream(
                                                     .saturating_sub(held.bytes);
                                                 ignored_held_indices.insert(index);
                                                 rewrote_incomplete_content = true;
+                                                anthropic_state.silent_recovery_requested = true;
                                                 for fallback in
                                                     incomplete_block_fallback_events(
                                                         index,
@@ -1296,6 +1300,7 @@ pub fn create_logged_passthrough_stream(
                                                     ignored_held_indices.insert(index);
                                                 }
                                                 rewrote_incomplete_content = true;
+                                                anthropic_state.silent_recovery_requested = true;
                                                 for fallback in
                                                     incomplete_block_fallback_events(
                                                         index,
@@ -1330,6 +1335,7 @@ pub fn create_logged_passthrough_stream(
                                                     && validation.saw_invalid_non_text_block;
                                                 let events = if invalid_tool {
                                                     rewrote_incomplete_content = true;
+                                                    anthropic_state.silent_recovery_requested = true;
                                                     incomplete_block_fallback_events(
                                                         index,
                                                         &held.block_type,
@@ -1374,7 +1380,7 @@ pub fn create_logged_passthrough_stream(
                                         }
                                         let suppress_midstream_error = descriptor.event_type
                                             == "error"
-                                            && anthropic_state.saw_message_start;
+                                            && terminal_policy.is_claude_desktop();
                                         if suppress_midstream_error {
                                             let mut error_state = AnthropicTerminalState::default();
                                             observe_anthropic_sse_block(
@@ -1393,9 +1399,8 @@ pub fn create_logged_passthrough_stream(
                                             rewrote_incomplete_content = true;
                                             if !anthropic_state.saw_text_delta {
                                                 completed_anthropic_blocks.extend(
-                                                    ensure_anthropic_recovery_text(
+                                                    ensure_anthropic_silent_recovery(
                                                         &mut anthropic_state,
-                                                        "CC Switch 已接管上游流错误并保留当前进度，将以可继续状态结束本轮。",
                                                     ),
                                                 );
                                             }
@@ -1493,9 +1498,8 @@ pub fn create_logged_passthrough_stream(
                                 &mut anthropic_state,
                             );
                             if terminal_policy.is_claude_desktop() {
-                                recovery_blocks.extend(ensure_anthropic_recovery_text(
+                                recovery_blocks.extend(ensure_anthropic_silent_recovery(
                                     &mut anthropic_state,
-                                    "CC Switch 已保留本轮已生成内容；上游发送了超大且未完成的流事件，已安全终止该事件。",
                                 ));
                             }
                             let terminals = anthropic_terminal_chunks(
@@ -1611,10 +1615,15 @@ pub fn create_logged_passthrough_stream(
                     if terminal_policy.is_anthropic() {
                         buffer.clear();
                         utf8_remainder.clear();
-                        let fallback_blocks = materialize_incomplete_anthropic_blocks(
+                        let mut fallback_blocks = materialize_incomplete_anthropic_blocks(
                             &mut held_anthropic_blocks,
                             &mut anthropic_state,
                         );
+                        if terminal_policy.is_claude_desktop() {
+                            fallback_blocks.extend(ensure_anthropic_silent_recovery(
+                                &mut anthropic_state,
+                            ));
+                        }
                         let terminals = anthropic_terminal_chunks(
                             &anthropic_state,
                             "stream_error",
@@ -1643,10 +1652,17 @@ pub fn create_logged_passthrough_stream(
                     if terminal_policy.is_anthropic() {
                         buffer.clear();
                         utf8_remainder.clear();
-                        let fallback_blocks = materialize_incomplete_anthropic_blocks(
+                        let mut fallback_blocks = materialize_incomplete_anthropic_blocks(
                             &mut held_anthropic_blocks,
                             &mut anthropic_state,
                         );
+                        if terminal_policy.is_claude_desktop()
+                            && !anthropic_can_complete_safely(&anthropic_state)
+                        {
+                            fallback_blocks.extend(ensure_anthropic_silent_recovery(
+                                &mut anthropic_state,
+                            ));
+                        }
                         rewrote_incomplete_content |= !fallback_blocks.is_empty();
                         let terminals = anthropic_terminal_chunks(
                             &anthropic_state,
@@ -2137,7 +2153,9 @@ mod tests {
             });
         let text = String::from_utf8(text).unwrap();
         assert!(text.contains("先检查一下。"), "{text}");
-        assert!(text.contains("已安全取消该块"), "{text}");
+        assert!(!text.contains("CC Switch"), "{text}");
+        assert!(!text.contains("安全取消"), "{text}");
+        assert!(!text.contains("自动续试"), "{text}");
         assert!(!text.contains("\"type\":\"tool_use\""), "{text}");
         assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
         assert!(text.contains("event: message_stop"), "{text}");
@@ -2203,10 +2221,79 @@ mod tests {
             });
         let text = String::from_utf8(text).unwrap();
         assert!(text.contains("reasoning"), "{text}");
-        assert!(text.contains("已安全取消该块"), "{text}");
+        assert!(!text.contains("CC Switch"), "{text}");
+        assert!(!text.contains("安全取消"), "{text}");
+        assert!(!text.contains("自动续试"), "{text}");
         assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
         assert!(text.contains("event: message_stop"), "{text}");
         assert!(!text.contains("event: error"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_error_before_message_start_is_silent_and_continuable() {
+        let source = futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Please retry later\"}}\n\n",
+        ))]);
+        let output = create_logged_passthrough_stream(
+            source,
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::ClaudeDesktopAnthropic,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("event: message_start"), "{text}");
+        assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+        assert!(!text.contains("text_delta"), "{text}");
+        assert!(!text.contains("CC Switch"), "{text}");
+        assert!(!text.contains("自动续试"), "{text}");
+        assert!(!text.contains("安全取消"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn claude_desktop_eof_before_message_start_is_silent_and_continuable() {
+        let output = create_logged_passthrough_stream(
+            futures::stream::empty::<Result<Bytes, std::io::Error>>(),
+            "test",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            SseTerminalPolicy::ClaudeDesktopAnthropic,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let text = output
+            .into_iter()
+            .map(Result::unwrap)
+            .fold(Vec::new(), |mut all, bytes| {
+                all.extend_from_slice(&bytes);
+                all
+            });
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("event: message_start"), "{text}");
+        assert!(text.contains("\"stop_reason\":\"max_tokens\""), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+        assert!(!text.contains("event: error"), "{text}");
+        assert!(!text.contains("text_delta"), "{text}");
+        assert!(!text.contains("CC Switch"), "{text}");
     }
 
     #[tokio::test]
@@ -2242,7 +2329,9 @@ mod tests {
             });
         let text = String::from_utf8(text).unwrap();
         assert!(text.contains("safe"), "{text}");
-        assert!(text.contains("已安全取消该块"), "{text}");
+        assert!(!text.contains("CC Switch"), "{text}");
+        assert!(!text.contains("安全取消"), "{text}");
+        assert!(!text.contains("自动续试"), "{text}");
         assert!(
             !text.contains(&"x".repeat(1024)),
             "oversized tool payload leaked"
