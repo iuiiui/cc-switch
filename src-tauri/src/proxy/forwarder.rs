@@ -373,7 +373,6 @@ impl AdaptiveLaunchGate {
 
     async fn wait_turn<F, Fut>(
         &self,
-        deadline: std::time::Instant,
         validate: F,
     ) -> Result<Option<std::time::Duration>, ProxyError>
     where
@@ -383,12 +382,7 @@ impl AdaptiveLaunchGate {
         // 持锁等待是有意设计：tokio Mutex 的队列把所有 Provider 的“请求启动”
         // 串成稳定节奏，但锁在真正发出请求前释放，不覆盖响应头或长流生命周期。
         let queued_at = std::time::Instant::now();
-        let mut last_start = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            self.last_start.lock(),
-        )
-        .await
-        .map_err(|_| ProxyError::Timeout("全局请求启动队列超过本轮 45 秒预算".to_string()))?;
+        let mut last_start = self.last_start.lock().await;
         loop {
             let interval_ms = self
                 .state
@@ -402,28 +396,13 @@ impl AdaptiveLaunchGate {
             if delay.is_zero() {
                 // 校验与 last_start 提交处于同一 gate 临界区。已 cooldown 的
                 // 候选不会写入时间戳，也就不会让后续 waiter 白等 750ms/2s。
-                let valid =
-                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), validate())
-                        .await
-                        .map_err(|_| {
-                            ProxyError::Timeout("全局请求启动校验超过本轮 45 秒预算".to_string())
-                        })?;
+                let valid = validate().await;
                 if !valid {
                     return Ok(None);
                 }
                 let committed_at = std::time::Instant::now();
-                if committed_at > deadline {
-                    return Err(ProxyError::Timeout(
-                        "全局请求启动校验超过本轮 45 秒预算".to_string(),
-                    ));
-                }
                 *last_start = Some(committed_at);
                 return Ok(Some(queued_at.elapsed()));
-            }
-            if now >= deadline || delay > deadline.saturating_duration_since(now) {
-                return Err(ProxyError::Timeout(
-                    "全局请求启动队列超过本轮 45 秒预算".to_string(),
-                ));
             }
             tokio::time::sleep(delay).await;
             // 429 可能在 sleep 期间把间隔从 750ms 拉长到 2s；重新读取并计算，
@@ -710,16 +689,19 @@ impl AdaptiveConcurrencyPermit {
     fn mark_success(&self) {
         self.limiter.mark_success();
         claude_desktop_launch_gate().mark_success();
+        claude_desktop_poll_launch_gate().mark_success();
     }
 
     fn mark_failure(&self) {
         self.limiter.mark_failure();
         claude_desktop_launch_gate().mark_failure();
+        claude_desktop_poll_launch_gate().mark_failure();
     }
 
     fn mark_rate_limited(&self, cooldown: std::time::Duration) {
         self.limiter.mark_rate_limited(cooldown);
         claude_desktop_launch_gate().mark_rate_limited(cooldown);
+        claude_desktop_poll_launch_gate().mark_rate_limited(cooldown);
     }
 }
 
@@ -799,7 +781,19 @@ fn claude_desktop_global_concurrency() -> Arc<Semaphore> {
     GLOBAL.get_or_init(|| Arc::new(Semaphore::new(3))).clone()
 }
 
+fn claude_desktop_poll_concurrency() -> Arc<Semaphore> {
+    static GLOBAL: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    // Desktop 的 max_tokens=1/2 内部探测只允许单路执行，避免多 agent 把探测
+    // 自身放大成 pending-request 风暴；它与正式长流使用不同队列，不再阻塞任务。
+    GLOBAL.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
+}
+
 fn claude_desktop_launch_gate() -> Arc<AdaptiveLaunchGate> {
+    static GATE: OnceLock<Arc<AdaptiveLaunchGate>> = OnceLock::new();
+    GATE.get_or_init(AdaptiveLaunchGate::new).clone()
+}
+
+fn claude_desktop_poll_launch_gate() -> Arc<AdaptiveLaunchGate> {
     static GATE: OnceLock<Arc<AdaptiveLaunchGate>> = OnceLock::new();
     GATE.get_or_init(AdaptiveLaunchGate::new).clone()
 }
@@ -809,13 +803,18 @@ async fn wait_for_claude_desktop_launch(
     provider: &Provider,
     router: &ProviderRouter,
     app_type_str: &str,
-    deadline: std::time::Instant,
+    internal_poll: bool,
 ) -> Result<bool, ProxyError> {
     if !matches!(app_type, AppType::ClaudeDesktop) {
         return Ok(true);
     }
-    let waited = claude_desktop_launch_gate()
-        .wait_turn(deadline, || async {
+    let gate = if internal_poll {
+        claude_desktop_poll_launch_gate()
+    } else {
+        claude_desktop_launch_gate()
+    };
+    let waited = gate
+        .wait_turn(|| async {
             !router
                 .is_provider_rate_limited(&provider.id, app_type_str)
                 .await
@@ -870,6 +869,7 @@ pub(crate) async fn reset_claude_desktop_adaptive_runtime(target_limit: usize) {
         limiter.reset_runtime(target_limit);
     }
     claude_desktop_launch_gate().reset().await;
+    claude_desktop_poll_launch_gate().reset().await;
     log::info!("[claude-desktop] 已重置动态并发窗口与全局启动闸门");
 }
 
@@ -1268,6 +1268,7 @@ impl RequestForwarder {
         })?;
         let app_type_str = app_type.as_str();
         let client_requested_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        let internal_poll = is_claude_desktop_internal_poll(app_type, &body);
 
         if providers.is_empty() {
             return Err(ForwardError {
@@ -1275,6 +1276,38 @@ impl RequestForwarder {
                 provider: None,
             });
         }
+
+        // 先进入请求级全局队列，再占用任一 Provider 的 AIMD 窗口。旧顺序会让
+        // 等待全局长流空位的请求提前锁住 Provider，最终形成“全局在等流、其它
+        // 请求又等 Provider”的容量倒置。队列不设本地 45 秒取消；客户端断开会
+        // 直接取消此 future。正式长流和内部短轮询分队列，轮询不会再饿死任务。
+        let global_queue = if matches!(app_type, AppType::ClaudeDesktop) {
+            if should_limit_claude_desktop_long_stream(app_type, client_requested_stream) {
+                Some((claude_desktop_global_concurrency(), "正式长流", 3usize))
+            } else if internal_poll {
+                Some((claude_desktop_poll_concurrency(), "内部轮询", 1usize))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut global_upstream_permit = if let Some((queue, label, limit)) = global_queue {
+            let queued_at = std::time::Instant::now();
+            let permit = queue.acquire_owned().await.map_err(|_| ForwardError {
+                error: ProxyError::ForwardFailed(format!("Claude Desktop {label}并发控制器已关闭")),
+                provider: None,
+            })?;
+            if queued_at.elapsed() >= std::time::Duration::from_millis(100) {
+                log::info!(
+                    "[claude-desktop] {label}并发上限={limit}，等待空位 {}ms",
+                    queued_at.elapsed().as_millis()
+                );
+            }
+            Some(permit)
+        } else {
+            None
+        };
 
         let mut last_error = None;
         let mut last_provider = None;
@@ -1286,13 +1319,12 @@ impl RequestForwarder {
         // 由 CC Switch 在同一个客户端请求内完成有界轮询。第一轮依次尝试队列；
         // max_retries 仍有剩余额度时可进入下一轮，而不是立即把错误交回 Claude
         // 触发它自己的 10 次指数退避重试。
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
         let mut consecutive_capacity_skips = 0usize;
+        let mut consecutive_circuit_skips = 0usize;
         let max_schedule_slots = if matches!(app_type, AppType::ClaudeDesktop) {
-            // AIMD 饱和跳过不算真实 attempt；额外调度槽只用于等待其它 Provider
-            // 释放容量，真实出站次数仍严格受 max_attempts 限制。
-            self.max_attempts
-                .saturating_add(providers.len().saturating_mul(512))
+            // AIMD 饱和跳过不算真实 attempt；Desktop admission 持续等待容量释放，
+            // 不再由本地调度槽或 45 秒预算中止。真实出站次数仍受 max_attempts。
+            usize::MAX
         } else {
             self.max_attempts
         };
@@ -1357,10 +1389,6 @@ impl RequestForwarder {
                 else {
                     continue;
                 };
-                let now = std::time::Instant::now();
-                if now >= retry_deadline || delay > retry_deadline.saturating_duration_since(now) {
-                    continue;
-                }
                 log::info!(
                     "[{app_type_str}] CC Switch 等待限流冷却 {}ms 后继续内部轮询",
                     delay.as_millis()
@@ -1378,9 +1406,7 @@ impl RequestForwarder {
                 let backoff = std::time::Duration::from_millis(
                     (retry_round as u64).saturating_mul(500).min(2_000),
                 );
-                let now = std::time::Instant::now();
-                if now < retry_deadline && backoff <= retry_deadline.saturating_duration_since(now)
-                {
+                if !backoff.is_zero() {
                     tokio::time::sleep(backoff).await;
                 }
             }
@@ -1396,19 +1422,10 @@ impl RequestForwarder {
                     consecutive_capacity_skips = consecutive_capacity_skips.saturating_add(1);
                     if consecutive_capacity_skips >= providers.len() {
                         consecutive_capacity_skips = 0;
-                        let now = std::time::Instant::now();
-                        if now >= retry_deadline {
-                            log::warn!(
-                                "[claude-desktop] 所有 Provider 并发窗口持续饱和 45 秒，停止 admission 等待"
-                            );
-                            break;
-                        }
                         let notified = claude_desktop_capacity_notify().notified();
-                        let pause = std::time::Duration::from_millis(100)
-                            .min(retry_deadline.saturating_duration_since(now));
                         tokio::select! {
                             _ = notified => {}
-                            _ = tokio::time::sleep(pause) => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                         }
                     }
                     continue;
@@ -1418,43 +1435,6 @@ impl RequestForwarder {
                 None
             };
 
-            let global_upstream_permit =
-                if should_limit_claude_desktop_long_stream(app_type, client_requested_stream) {
-                    let queued_at = std::time::Instant::now();
-                    match tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(retry_deadline),
-                        claude_desktop_global_concurrency().acquire_owned(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(permit)) => {
-                            if queued_at.elapsed() >= std::time::Duration::from_millis(100) {
-                                log::info!(
-                                    "[claude-desktop] 全局长流并发上限=3，等待空位 {}ms",
-                                    queued_at.elapsed().as_millis()
-                                );
-                            }
-                            Some(permit)
-                        }
-                        Ok(Err(_)) => {
-                            last_error = Some(ProxyError::ForwardFailed(
-                                "Claude Desktop 全局并发控制器已关闭".to_string(),
-                            ));
-                            last_provider = Some(provider.clone());
-                            break;
-                        }
-                        Err(_) => {
-                            last_error = Some(ProxyError::Timeout(
-                                "Claude Desktop 全局长流并发等待超过本轮 45 秒预算".to_string(),
-                            ));
-                            last_provider = Some(provider.clone());
-                            break;
-                        }
-                    }
-                } else {
-                    None
-                };
-
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
             // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
             let permit = self
@@ -1463,9 +1443,17 @@ impl RequestForwarder {
                 .await;
 
             if !permit.allowed {
+                consecutive_circuit_skips = consecutive_circuit_skips.saturating_add(1);
+                if matches!(app_type, AppType::ClaudeDesktop)
+                    && consecutive_circuit_skips >= providers.len()
+                {
+                    consecutive_circuit_skips = 0;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
                 continue;
             }
             consecutive_capacity_skips = 0;
+            consecutive_circuit_skips = 0;
             let mut circuit_permit = CircuitPermitGuard::new(
                 self.router.clone(),
                 provider.id.clone(),
@@ -1494,7 +1482,7 @@ impl RequestForwarder {
                 provider,
                 self.router.as_ref(),
                 app_type_str,
-                retry_deadline,
+                internal_poll,
             )
             .await
             {
@@ -1577,7 +1565,7 @@ impl RequestForwarder {
                         outbound_model,
                         connection_guard: None,
                         upstream_permit,
-                        global_upstream_permit,
+                        global_upstream_permit: global_upstream_permit.take(),
                         stream_outcome,
                     });
                 }
@@ -1620,7 +1608,7 @@ impl RequestForwarder {
                                 provider,
                                 self.router.as_ref(),
                                 app_type_str,
-                                retry_deadline,
+                                internal_poll,
                             )
                             .await
                             {
@@ -1706,7 +1694,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         connection_guard: None,
                                         upstream_permit,
-                                        global_upstream_permit,
+                                        global_upstream_permit: global_upstream_permit.take(),
                                         stream_outcome,
                                     });
                                 }
@@ -1794,7 +1782,7 @@ impl RequestForwarder {
                                     provider,
                                     self.router.as_ref(),
                                     app_type_str,
-                                    retry_deadline,
+                                    internal_poll,
                                 )
                                 .await
                                 {
@@ -1878,7 +1866,7 @@ impl RequestForwarder {
                                             outbound_model,
                                             connection_guard: None,
                                             upstream_permit,
-                                            global_upstream_permit,
+                                            global_upstream_permit: global_upstream_permit.take(),
                                             stream_outcome,
                                         });
                                     }
@@ -1984,7 +1972,7 @@ impl RequestForwarder {
                                 provider,
                                 self.router.as_ref(),
                                 app_type_str,
-                                retry_deadline,
+                                internal_poll,
                             )
                             .await
                             {
@@ -2068,7 +2056,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         connection_guard: None,
                                         upstream_permit,
-                                        global_upstream_permit,
+                                        global_upstream_permit: global_upstream_permit.take(),
                                         stream_outcome,
                                     });
                                 }
@@ -4079,6 +4067,15 @@ fn should_limit_claude_desktop_long_stream(
     matches!(app_type, AppType::ClaudeDesktop) && client_requested_stream
 }
 
+fn is_claude_desktop_internal_poll(app_type: &AppType, body: &Value) -> bool {
+    matches!(app_type, AppType::ClaudeDesktop)
+        && !body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+        && body
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|max_tokens| max_tokens <= 3)
+}
+
 fn effective_response_header_timeout(
     request_is_streaming: bool,
     streaming_first_byte_timeout: std::time::Duration,
@@ -5260,13 +5257,12 @@ mod tests {
     async fn claude_desktop_launch_gate_serializes_request_starts() {
         let gate = AdaptiveLaunchGate::new();
         gate.state.lock().expect("gate state").interval_ms = 20;
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        gate.wait_turn(deadline, || async { true })
+        gate.wait_turn(|| async { true })
             .await
             .expect("first launch")
             .expect("first granted");
         let waited = gate
-            .wait_turn(deadline, || async { true })
+            .wait_turn(|| async { true })
             .await
             .expect("second launch")
             .expect("second granted");
@@ -5315,36 +5311,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_desktop_launch_gate_respects_retry_deadline() {
+    async fn claude_desktop_launch_gate_waits_instead_of_cancelling_queued_turn() {
         let gate = AdaptiveLaunchGate::new();
-        gate.state.lock().expect("gate state").interval_ms = 2_000;
-        gate.wait_turn(
-            std::time::Instant::now() + Duration::from_secs(1),
-            || async { true },
+        gate.state.lock().expect("gate state").interval_ms = 50;
+        gate.wait_turn(|| async { true })
+            .await
+            .expect("first launch");
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            gate.wait_turn(|| async { true }),
         )
         .await
-        .expect("first launch");
-        let result = gate
-            .wait_turn(
-                std::time::Instant::now() + Duration::from_millis(20),
-                || async { true },
-            )
-            .await;
-        assert!(matches!(result, Err(ProxyError::Timeout(_))));
+        .expect("queued turn should eventually launch")
+        .expect("launch gate result")
+        .expect("queued turn granted");
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(result >= Duration::from_millis(40));
     }
 
     #[tokio::test]
     async fn claude_desktop_launch_gate_skips_stale_turn_before_commit() {
         let gate = AdaptiveLaunchGate::new();
         gate.state.lock().expect("gate state").interval_ms = 100;
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        gate.wait_turn(deadline, || async { true })
+        gate.wait_turn(|| async { true })
             .await
             .expect("initial turn")
             .expect("initial granted");
         let (stale, next) = tokio::join!(
-            gate.wait_turn(deadline, || async { false }),
-            gate.wait_turn(deadline, || async { true }),
+            gate.wait_turn(|| async { false }),
+            gate.wait_turn(|| async { true }),
         );
         assert!(stale.expect("stale result").is_none());
         let next = next
@@ -5360,8 +5356,7 @@ mod tests {
     async fn claude_desktop_launch_gate_timestamps_after_validation() {
         let gate = AdaptiveLaunchGate::new();
         gate.state.lock().expect("gate state").interval_ms = 100;
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        gate.wait_turn(deadline, || async {
+        gate.wait_turn(|| async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             true
         })
@@ -5369,7 +5364,7 @@ mod tests {
         .expect("validated turn")
         .expect("turn granted");
         let second = gate
-            .wait_turn(deadline, || async { true })
+            .wait_turn(|| async { true })
             .await
             .expect("second turn")
             .expect("second granted");
@@ -5380,22 +5375,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_desktop_global_long_stream_limit_is_three() {
-        let limiter = Arc::new(Semaphore::new(3));
-        let first = limiter.clone().acquire_owned().await.unwrap();
-        let second = limiter.clone().acquire_owned().await.unwrap();
-        let third = limiter.clone().acquire_owned().await.unwrap();
-        let blocked =
-            tokio::time::timeout(Duration::from_millis(20), limiter.clone().acquire_owned()).await;
+    async fn claude_desktop_long_stream_and_poll_queues_are_isolated() {
+        let long_queue = claude_desktop_global_concurrency();
+        let poll_queue = claude_desktop_poll_concurrency();
+        let first = long_queue.clone().acquire_owned().await.unwrap();
+        let second = long_queue.clone().acquire_owned().await.unwrap();
+        let third = long_queue.clone().acquire_owned().await.unwrap();
+        let poll = poll_queue.clone().acquire_owned().await.unwrap();
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(20),
+            long_queue.clone().acquire_owned(),
+        )
+        .await;
         assert!(blocked.is_err(), "a fourth long stream must wait");
+        let second_poll = tokio::time::timeout(
+            Duration::from_millis(20),
+            poll_queue.clone().acquire_owned(),
+        )
+        .await;
+        assert!(second_poll.is_err(), "internal polls must be serialized");
         drop(first);
-        let fourth = tokio::time::timeout(Duration::from_secs(1), limiter.clone().acquire_owned())
-            .await
-            .expect("released global slot")
-            .unwrap();
+        let fourth =
+            tokio::time::timeout(Duration::from_secs(1), long_queue.clone().acquire_owned())
+                .await
+                .expect("released global slot")
+                .unwrap();
         drop(second);
         drop(third);
         drop(fourth);
+        drop(poll);
+    }
+
+    #[test]
+    fn claude_desktop_internal_poll_detection_is_narrow() {
+        assert!(is_claude_desktop_internal_poll(
+            &AppType::ClaudeDesktop,
+            &json!({"stream": false, "max_tokens": 1})
+        ));
+        assert!(is_claude_desktop_internal_poll(
+            &AppType::ClaudeDesktop,
+            &json!({"max_tokens": 3})
+        ));
+        assert!(!is_claude_desktop_internal_poll(
+            &AppType::ClaudeDesktop,
+            &json!({"stream": false, "max_tokens": 4})
+        ));
+        assert!(!is_claude_desktop_internal_poll(
+            &AppType::ClaudeDesktop,
+            &json!({"stream": true, "max_tokens": 1})
+        ));
+        assert!(!is_claude_desktop_internal_poll(
+            &AppType::Claude,
+            &json!({"stream": false, "max_tokens": 1})
+        ));
     }
 
     #[test]

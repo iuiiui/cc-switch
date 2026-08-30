@@ -98,6 +98,7 @@ impl ProviderRouter {
         } else if auto_failover_enabled {
             // 故障转移开启：仅按队列顺序依次尝试（P1 → P2 → ...）
             let all_providers = self.db.get_all_providers(app_type)?;
+            let desktop_waits_for_recovery = app_type == AppType::ClaudeDesktop.as_str();
 
             // 使用 DAO 返回的排序结果，确保和前端展示一致
             let mut ordered_ids: Vec<String> = self
@@ -133,13 +134,17 @@ impl ProviderRouter {
                 ) && self.is_provider_rate_limited(&provider.id, app_type).await
                 {
                     circuit_open_count += 1;
-                    continue;
+                    // Claude Desktop 由 forwarder 在当前客户端请求内等待 cooldown；
+                    // 这里若先过滤掉全部候选，就会绕过内部轮询并直接返回 503。
+                    if !desktop_waits_for_recovery {
+                        continue;
+                    }
                 }
 
                 let circuit_key = format!("{app_type}:{}", provider.id);
                 let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
 
-                if breaker.is_available().await {
+                if breaker.is_available().await || desktop_waits_for_recovery {
                     result.push(provider);
                 } else {
                     circuit_open_count += 1;
@@ -416,7 +421,9 @@ impl ProviderRouter {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::provider::{AuthBinding, AuthBindingSource, ProviderMeta};
+    use crate::provider::{
+        AuthBinding, AuthBindingSource, ClaudeDesktopMode, ClaudeDesktopModelRoute, ProviderMeta,
+    };
     use serde_json::json;
     use serial_test::serial;
     use std::env;
@@ -437,6 +444,34 @@ mod tests {
                 auth_provider: Some("codex_oauth".to_string()),
                 account_id: Some(account_id.to_string()),
             }),
+            ..Default::default()
+        });
+        provider
+    }
+
+    fn desktop_proxy_provider(id: &str) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            format!("Desktop {id}"),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com/anthropic",
+                    "ANTHROPIC_AUTH_TOKEN": "test-token"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            claude_desktop_mode: Some(ClaudeDesktopMode::Proxy),
+            api_format: Some("anthropic".to_string()),
+            claude_desktop_model_routes: std::collections::HashMap::from([(
+                "claude-sonnet-5".to_string(),
+                ClaudeDesktopModelRoute {
+                    model: "upstream-model".to_string(),
+                    label_override: None,
+                    supports_1m: Some(true),
+                },
+            )]),
             ..Default::default()
         });
         provider
@@ -557,6 +592,81 @@ mod tests {
         // 故障转移开启时：仅按队列顺序选择（忽略当前供应商）
         assert_eq!(providers[0].id, "b");
         assert_eq!(providers[1].id, "a");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn claude_desktop_keeps_rate_limited_queue_for_forwarder_waiting() {
+        use crate::proxy::types::{FailoverPolicy, FailoverStrategy};
+
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        for id in ["desktop-a", "desktop-b"] {
+            let provider = desktop_proxy_provider(id);
+            db.save_provider("claude-desktop", &provider).unwrap();
+            db.add_to_failover_queue("claude-desktop", id).unwrap();
+        }
+        db.set_current_provider("claude-desktop", "desktop-a")
+            .unwrap();
+        crate::settings::set_current_provider(&AppType::ClaudeDesktop, Some("desktop-a")).unwrap();
+        let mut config = db.get_proxy_config_for_app("claude-desktop").await.unwrap();
+        config.auto_failover_enabled = true;
+        config.circuit_failure_threshold = 1;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        db.set_failover_policy(
+            "claude-desktop",
+            &FailoverPolicy {
+                strategy: FailoverStrategy::StickyRotation,
+                rate_limit_cooldown_seconds: 30,
+                max_rate_limit_cooldown_seconds: 300,
+            },
+        )
+        .unwrap();
+
+        let router = ProviderRouter::new(db);
+        router
+            .mark_provider_rate_limited("desktop-a", "claude-desktop")
+            .await
+            .unwrap();
+        router
+            .mark_provider_rate_limited("desktop-b", "claude-desktop")
+            .await
+            .unwrap();
+
+        let providers = router
+            .select_providers("claude-desktop")
+            .await
+            .expect("Desktop forwarder must receive cooldown candidates");
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["desktop-a", "desktop-b"]
+        );
+        assert!(providers
+            .iter()
+            .all(|provider| provider_supports_failover("claude-desktop", provider)));
+
+        router.reset_app_runtime_state("claude-desktop").await;
+        let permit = router
+            .begin_provider_request("desktop-a", "claude-desktop", false)
+            .await;
+        router
+            .record_result(
+                "desktop-a",
+                "claude-desktop",
+                permit,
+                false,
+                Some("upstream unavailable".to_string()),
+            )
+            .await
+            .unwrap();
+        let providers = router
+            .select_providers("claude-desktop")
+            .await
+            .expect("Desktop forwarder must also receive circuit-open candidates");
+        assert!(providers.iter().any(|provider| provider.id == "desktop-a"));
     }
 
     #[tokio::test]
